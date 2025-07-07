@@ -9,6 +9,10 @@ import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
+import traceback
+from seleniumbase import SB
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class OliveYoungReviewGUI:
     def __init__(self, root):
@@ -26,14 +30,16 @@ class OliveYoungReviewGUI:
     def check_packages(self):
         try:
             import pandas as pd
+            from seleniumbase import SB
+            import requests
         except ImportError:
-            if messagebox.askyesno("패키지 설치", "필요한 패키지(pandas, requests, openpyxl)를 설치해야 합니다. 지금 설치하시겠습니까?"):
+            if messagebox.askyesno("패키지 설치", "필요한 패키지(pandas, openpyxl, seleniumbase, requests)를 설치해야 합니다. 지금 설치하시겠습니까?"):
                 self.install_packages()
     
     def install_packages(self):
         def run_install():
             try:
-                packages = ['pandas', 'requests', 'openpyxl']
+                packages = ['pandas', 'openpyxl', 'seleniumbase', 'requests']
                 for package in packages:
                     subprocess.check_call([sys.executable, '-m', 'pip', 'install', package])
                 messagebox.showinfo("설치 완료", "필요한 패키지 설치가 완료되었습니다.")
@@ -51,7 +57,7 @@ class OliveYoungReviewGUI:
         main_frame.pack(fill=tk.BOTH, expand=True)
         
         # 제목
-        title_label = ttk.Label(main_frame, text="올리브영 리뷰 수집기", font=("Malgun Gothic", 16, "bold"))
+        title_label = ttk.Label(main_frame, text="올리브영 리뷰 수집기 - by 꼬질강쥐", font=("Malgun Gothic", 16, "bold"))
         title_label.pack(pady=10)
         
         # 입력 영역 프레임
@@ -277,7 +283,7 @@ class OliveYoungReviewGUI:
             self.start_button.config(state=tk.NORMAL)
             self.stop_button.config(state=tk.DISABLED)
     
-    # 임의의 User-Agent 생성 함수
+    # 임의의 User-Agent 생성 함수 (더 이상 사용되지 않음)
     def get_random_user_agent(self):
         user_agents = [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0',
@@ -288,24 +294,47 @@ class OliveYoungReviewGUI:
         ]
         return random.choice(user_agents)
     
-    # API 호출을 통해 리뷰 데이터 수집
+    # 셀레니움을 사용하여 최신 쿠키와 헤더 가져오기
     def get_reviews(self, product_id, total_pages=100):
         all_reviews = []
         
         # 세션 생성 - 쿠키 유지
         session = requests.Session()
         
-        # 먼저 상품 페이지 방문하여 필요한 쿠키 획득
-        product_url = f'https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo={product_id}'
+        # 직접 Selenium을 사용하여 최신 쿠키와 헤더 가져오기
+        self.log("Selenium을 사용하여 최신 인증 정보 획득 중...")
         try:
-            session.get(product_url, 
-                       headers={'User-Agent': self.get_random_user_agent()},
-                       timeout=10)
-            # 더 긴 초기 쿠키 획득 대기 시간 추가
-            time.sleep(5)  # 2초에서 5초로 증가
+            with SB(uc=True, headless=False) as sb:
+                # 상품 페이지로 이동하여 쿠키 획득
+                product_url = f'https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo={product_id}'
+                sb.open(product_url)
+                
+                self.log("캡차(CAPTCHA)가 나타나면 5분 안에 해결해주세요...")
+                # 페이지가 완전히 로드될 때까지 대기
+                try:
+                    sb.wait_for_element_visible("body", timeout=300)
+                    self.log("페이지 로드 완료.")
+                except:
+                    self.log("페이지 로드 대기 중...")
+                sb.sleep(2)  # 안정성을 위한 대기
+
+                # 쿠키와 헤더 정보 추출
+                cookies = sb.get_cookies()
+                cookie_dict = {c['name']: c['value'] for c in cookies}
+                
+                user_agent = sb.get_user_agent()
+                
+                # 쿠키를 세션에 적용
+                for cookie in cookies:
+                    session.cookies.set(cookie['name'], cookie['value'])
+                
+                self.log("인증 정보 획득 완료. 브라우저를 닫고 리뷰 수집을 시작합니다.")
+                
         except Exception as e:
-            self.log(f"상품 페이지 접속 실패: {e}")
-        
+            self.log(f"Selenium 인증 정보 획득 실패: {e}")
+            traceback.print_exc()
+            return []
+
         # 진행 상황 표시 변수
         progress_interval = max(1, total_pages // 20)  # 5% 간격으로 진행 상황 표시
         start_time = time.time()
@@ -318,7 +347,7 @@ class OliveYoungReviewGUI:
             
             # 헤더 설정 - 매 요청마다 약간 다르게 설정
             headers = {
-                'User-Agent': self.get_random_user_agent(),
+                'User-Agent': user_agent,
                 'Referer': f'https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo={product_id}',
                 'Accept': '*/*',
                 'Accept-Language': 'ko,en;q=0.9,en-US;q=0.8',
@@ -356,8 +385,8 @@ class OliveYoungReviewGUI:
             
             while retry_count < max_retries:
                 try:
-                    # API 호출
-                    response = session.get(url, params=params, headers=headers, timeout=20)  # 타임아웃 증가
+                    # API 호출 (SSL 검증 비활성화)
+                    response = session.get(url, params=params, headers=headers, timeout=20, verify=False)
                     
                     # 응답이 성공적이면 반복문 종료
                     if response.status_code == 200:
@@ -365,7 +394,7 @@ class OliveYoungReviewGUI:
                         
                     # 오류 발생 시 대기 시간 증가 및 재시도
                     retry_count += 1
-                    time.sleep(5 * retry_count)  # 점진적 대기 시간 증가
+                    time.sleep(random.uniform(3, 5))
                     
                 except Exception as e:
                     self.log(f"페이지 {page} 요청 중 오류, 재시도 {retry_count+1}/{max_retries}: {e}")
@@ -384,11 +413,12 @@ class OliveYoungReviewGUI:
                     if '<html' in response.text.lower():
                         self.log(f"페이지 {page}의 응답이 HTML 형식입니다. API가 차단되었을 수 있습니다.")
                         if page <= 2:
-                            self.log("\n=== 도움말 ===")
+                            self.log("=== 도움말 ===")
                             self.log("1. 올리브영 웹사이트에 직접 접속해 로그인을 시도해 보세요.")
                             self.log("2. 웹사이트에서 캡차(CAPTCHA) 인증이 필요할 수 있습니다.")
                             self.log("3. VPN이나 프록시를 사용 중이라면 해제해 보세요.")
                             self.log("4. 잠시 후에 다시 시도해 보세요.")
+                            self.log("============")
                             
                             if page == 1:
                                 self.log("첫 페이지 요청에 실패했습니다.")
@@ -406,6 +436,11 @@ class OliveYoungReviewGUI:
                         
                         # 현재 페이지 리뷰 정보 출력
                         self.log(f"페이지 {page}: {len(reviews_on_page)}개의 리뷰를 수집했습니다. (총 {len(all_reviews)}개)")
+                        
+                        # 각 리뷰 정보 간략히 출력
+                        for idx, review in enumerate(reviews_on_page, 1):
+                            if idx <= 3:  # 처음 3개만 표시
+                                self.log(f"  - 리뷰 {idx}: {review.get('gdasScrVal')}점, {review.get('mbrNickNm')}, 작성일: {review.get('dispRegDate')}")
                         
                         # 진행률 업데이트
                         progress = (page / total_pages) * 100
@@ -478,7 +513,7 @@ class OliveYoungReviewGUI:
                 self.log(f"경과 시간: {elapsed:.1f}초, 남은 예상 시간: {remaining:.1f}초")
                 
             # 서버 부하 방지를 위한 대기 시간
-            time.sleep(random.uniform(3, 5))  # 1~3초에서 3~5초로 증가
+            time.sleep(random.uniform(1, 3))  # 1~3초 대기
                 
         return all_reviews
     
