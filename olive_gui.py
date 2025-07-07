@@ -76,13 +76,9 @@ class OliveYoungReviewGUI:
         pages_spin = ttk.Spinbox(input_frame, from_=1, to=1000, textvariable=self.max_pages_var, width=10)
         pages_spin.grid(row=1, column=1, sticky=tk.W, pady=5)
         
-        # 출력 형식 선택
+        # 출력 형식 안내
         ttk.Label(input_frame, text="출력 형식:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.output_format_var = tk.StringVar(value="1")
-        excel_radio = ttk.Radiobutton(input_frame, text="엑셀(.xlsx)", variable=self.output_format_var, value="1")
-        json_radio = ttk.Radiobutton(input_frame, text="JSON", variable=self.output_format_var, value="2")
-        excel_radio.grid(row=2, column=1, sticky=tk.W, pady=5)
-        json_radio.grid(row=2, column=2, sticky=tk.W, pady=5)
+        ttk.Label(input_frame, text="엑셀(.xlsx)과 JSON 파일 모두 저장됩니다", font=("Malgun Gothic", 9)).grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=5)
         
         # 저장 경로 선택
         ttk.Label(input_frame, text="저장 경로:").grid(row=3, column=0, sticky=tk.W, pady=5)
@@ -195,7 +191,6 @@ class OliveYoungReviewGUI:
             # 설정값 가져오기
             product_id = self.product_id_var.get().strip()
             max_pages = self.max_pages_var.get()
-            output_format = self.output_format_var.get()
             save_path = self.save_path_var.get()
             
             # 원래 작업 디렉토리 저장
@@ -254,18 +249,21 @@ class OliveYoungReviewGUI:
                 os.chdir(original_dir)
                 return
             
-            # 결과 저장
+            # 결과 저장 (JSON과 엑셀 둘 다 저장)
             self.status_var.set("결과 저장 중...")
-            if output_format == "1":  # 엑셀 형식
-                output_filename = f'올리브영_리뷰_{product_id}_{date_str}.xlsx'
-                df.to_excel(output_filename, index=False, engine='openpyxl')
-                self.log(f"총 {len(df)}개의 리뷰를 '{output_filename}' 파일로 저장했습니다.")
-                self.log(f"파일 위치: {os.path.abspath(output_filename)}")
-            else:  # JSON 형식
-                output_filename = f'올리브영_리뷰_가공_{product_id}_{date_str}.json'
-                df.to_json(output_filename, force_ascii=False, orient='records', indent=2)
-                self.log(f"총 {len(df)}개의 리뷰를 '{output_filename}' 파일로 저장했습니다.")
-                self.log(f"파일 위치: {os.path.abspath(output_filename)}")
+            
+            # 엑셀 파일 저장
+            excel_filename = f'올리브영_리뷰_{product_id}_{date_str}.xlsx'
+            df.to_excel(excel_filename, index=False, engine='openpyxl')
+            self.log(f"엑셀 파일: '{excel_filename}' 저장 완료")
+            
+            # JSON 파일 저장
+            json_processed_filename = f'올리브영_리뷰_가공_{product_id}_{date_str}.json'
+            df.to_json(json_processed_filename, force_ascii=False, orient='records', indent=2)
+            self.log(f"JSON 파일: '{json_processed_filename}' 저장 완료")
+            
+            self.log(f"총 {len(df)}개의 리뷰를 엑셀과 JSON 파일로 저장했습니다.")
+            self.log(f"파일 위치: {os.path.abspath(excel_filename)}")
             
             # 완료 처리
             self.progress_var.set(100)
@@ -394,7 +392,7 @@ class OliveYoungReviewGUI:
                         
                     # 오류 발생 시 대기 시간 증가 및 재시도
                     retry_count += 1
-                    time.sleep(random.uniform(3, 5))
+                    time.sleep(random.uniform(2, 3))
                     
                 except Exception as e:
                     self.log(f"페이지 {page} 요청 중 오류, 재시도 {retry_count+1}/{max_retries}: {e}")
@@ -403,7 +401,7 @@ class OliveYoungReviewGUI:
                     continue
             
             # 서버 부하 방지 대기 시간을 더 일관되게 설정
-            time.sleep(2)  # 무작위가 아닌 고정 대기 시간
+            time.sleep(1)  # 빠른 대기 시간
             
             # 응답 확인
             if response.status_code == 200:
@@ -423,7 +421,7 @@ class OliveYoungReviewGUI:
                             if page == 1:
                                 self.log("첫 페이지 요청에 실패했습니다.")
                                 return []
-                        time.sleep(10)  # 10초 대기
+                        time.sleep(5)  # 5초 대기
                         continue
                 
                 try:
@@ -469,7 +467,7 @@ class OliveYoungReviewGUI:
                             return []
                     
                     if page > 1:  # 첫 페이지가 아니면 API 오류로 간주하고 스킵
-                        time.sleep(15)  # 15초 대기
+                        time.sleep(5)  # 5초 대기
                         continue
                     else:
                         self.log("API 응답 형식이 예상과 다릅니다.")
@@ -484,7 +482,7 @@ class OliveYoungReviewGUI:
                 
                 # 429 (Too Many Requests) 오류 시 더 오래 대기
                 if response.status_code == 429:
-                    wait_time = 60  # 60초 대기
+                    wait_time = 20  # 20초 대기
                     self.log(f"너무 많은 요청을 보냈습니다. {wait_time}초 대기 후 다시 시도합니다.")
                     time.sleep(wait_time)
                     page -= 1  # 같은 페이지 다시 시도
@@ -492,14 +490,14 @@ class OliveYoungReviewGUI:
                 
                 # 403 (Forbidden) 오류 시 더 오래 대기하고 헤더 변경
                 if response.status_code == 403:
-                    wait_time = 120  # 120초 대기
+                    wait_time = 30  # 30초 대기
                     self.log(f"접근이 거부되었습니다. {wait_time}초 대기 후 다시 시도합니다.")
                     time.sleep(wait_time)
                     continue
                 
                 # 500번대 서버 오류이면 잠시 대기 후 계속
                 if 500 <= response.status_code < 600:
-                    time.sleep(20)
+                    time.sleep(5)
                     continue
             
             # 진행 상황 표시
@@ -513,7 +511,7 @@ class OliveYoungReviewGUI:
                 self.log(f"경과 시간: {elapsed:.1f}초, 남은 예상 시간: {remaining:.1f}초")
                 
             # 서버 부하 방지를 위한 대기 시간
-            time.sleep(random.uniform(1, 3))  # 1~3초 대기
+            time.sleep(random.uniform(1, 1.5))  # 0.2~0.8초 대기
                 
         return all_reviews
     
