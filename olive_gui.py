@@ -57,7 +57,7 @@ class OliveYoungReviewGUI:
         main_frame.pack(fill=tk.BOTH, expand=True)
         
         # 제목
-        title_label = ttk.Label(main_frame, text="올리브영 리뷰 수집기 - by 꼬질강쥐", font=("Malgun Gothic", 16, "bold"))
+        title_label = ttk.Label(main_frame, text="올리브영 리뷰 수집기1.2 - by 꼬질강쥐", font=("Malgun Gothic", 16, "bold"))
         title_label.pack(pady=10)
         
         # 입력 영역 프레임
@@ -266,20 +266,31 @@ class OliveYoungReviewGUI:
             self.log(f"파일 위치: {os.path.abspath(excel_filename)}")
             
             # 완료 처리
-            self.progress_var.set(100)
-            self.status_var.set(f"완료 ({len(df)}개 리뷰 저장)")
-            messagebox.showinfo("완료", f"총 {len(df)}개의 리뷰 수집이 완료되었습니다.")
+            self.root.after(0, lambda: self.progress_var.set(100))
+            self.root.after(0, lambda: self.status_var.set(f"완료 ({len(df)}개 리뷰 저장)"))
+            
+            # GUI 업데이트를 위한 짧은 대기
+            time.sleep(0.5)
+            
+            # 완료 메시지 표시
+            self.root.after(0, lambda: messagebox.showinfo("완료", f"총 {len(df)}개의 리뷰 수집이 완료되었습니다.\n\n파일 저장 위치:\n{os.path.abspath(excel_filename)}"))
             
             # 원래 디렉토리로 돌아감
             os.chdir(original_dir)
             
         except Exception as e:
             self.log(f"오류 발생: {str(e)}")
-            self.status_var.set("오류 발생")
-            messagebox.showerror("오류", f"리뷰 수집 중 오류가 발생했습니다:\n{str(e)}")
+            self.root.after(0, lambda: self.status_var.set("오류 발생"))
+            self.root.after(0, lambda: messagebox.showerror("오류", f"리뷰 수집 중 오류가 발생했습니다:\n{str(e)}"))
+            # 원래 디렉토리로 돌아감 (오류 시에도)
+            try:
+                os.chdir(original_dir)
+            except:
+                pass
         finally:
-            self.start_button.config(state=tk.NORMAL)
-            self.stop_button.config(state=tk.DISABLED)
+            # GUI 업데이트를 메인 스레드에서 실행
+            self.root.after(0, lambda: self.start_button.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.stop_button.config(state=tk.DISABLED))
     
     # 임의의 User-Agent 생성 함수 (더 이상 사용되지 않음)
     def get_random_user_agent(self):
@@ -308,13 +319,54 @@ class OliveYoungReviewGUI:
                 sb.open(product_url)
                 
                 self.log("캡차(CAPTCHA)가 나타나면 5분 안에 해결해주세요...")
-                # 페이지가 완전히 로드될 때까지 대기
+                self.log("캡차 해결 후 상품 정보가 완전히 로드될 때까지 기다립니다...")
+                
+                # 캡차 해결 후 실제 콘텐츠가 로드되는 것을 기다림
+                # 여러 가능한 요소들을 순서대로 확인
+                content_loaded = False
                 try:
-                    sb.wait_for_element_visible("body", timeout=300)
-                    self.log("페이지 로드 완료.")
-                except:
-                    self.log("페이지 로드 대기 중...")
-                sb.sleep(2)  # 안정성을 위한 대기
+                    # 1. 리뷰 영역 확인 (가장 확실한 방법)
+                    if sb.is_element_present("#gdasContents"):
+                        sb.wait_for_element_visible("#gdasContents", timeout=300)
+                        content_loaded = True
+                        self.log("리뷰 영역이 로드되었습니다.")
+                    # 2. 상품 정보 영역 확인
+                    elif sb.is_element_present(".prd_detail_box"):
+                        sb.wait_for_element_visible(".prd_detail_box", timeout=300)
+                        content_loaded = True
+                        self.log("상품 정보 영역이 로드되었습니다.")
+                    # 3. 상품 이미지 영역 확인
+                    elif sb.is_element_present(".prd_img"):
+                        sb.wait_for_element_visible(".prd_img", timeout=300)
+                        content_loaded = True
+                        self.log("상품 이미지 영역이 로드되었습니다.")
+                    # 4. 기본 대기 (위 요소들이 없는 경우)
+                    else:
+                        self.log("기본 페이지 로드 대기 중...")
+                        sb.sleep(10)  # 10초 기본 대기
+                        content_loaded = True
+                        
+                except Exception as wait_error:
+                    self.log(f"콘텐츠 로드 대기 중 오류: {wait_error}")
+                    self.log("수동으로 캡차를 해결하고 Enter 키를 눌러주세요...")
+                    
+                    # 사용자가 수동으로 캡차를 해결할 시간 제공
+                    for i in range(30):  # 30초 동안 1초씩 확인
+                        sb.sleep(1)
+                        if sb.is_element_present("#gdasContents") or sb.is_element_present(".prd_detail_box"):
+                            content_loaded = True
+                            self.log("콘텐츠가 로드되었습니다!")
+                            break
+                        if i % 5 == 0:  # 5초마다 안내 메시지
+                            remaining = 30 - i
+                            self.log(f"캡차 해결 대기 중... (남은 시간: {remaining}초)")
+                
+                if not content_loaded:
+                    self.log("⚠️ 콘텐츠 로드를 확인할 수 없습니다.")
+                    self.log("캡차가 해결되었다면 계속 진행합니다.")
+                
+                # 추가 안정성을 위한 대기
+                sb.sleep(3)
 
                 # 쿠키와 헤더 정보 추출
                 cookies = sb.get_cookies()
@@ -392,16 +444,16 @@ class OliveYoungReviewGUI:
                         
                     # 오류 발생 시 대기 시간 증가 및 재시도
                     retry_count += 1
-                    time.sleep(random.uniform(2, 3))
+                    time.sleep(random.uniform(3, 6))  # 3~6초 랜덤 대기
                     
                 except Exception as e:
                     self.log(f"페이지 {page} 요청 중 오류, 재시도 {retry_count+1}/{max_retries}: {e}")
                     retry_count += 1
-                    time.sleep(5)
+                    time.sleep(random.uniform(8, 12))  # 8~12초 랜덤 대기
                     continue
             
             # 서버 부하 방지 대기 시간을 더 일관되게 설정
-            time.sleep(1)  # 빠른 대기 시간
+            time.sleep(random.uniform(1.5, 2.5))  # 1.5~2.5초 랜덤 대기
             
             # 응답 확인
             if response.status_code == 200:
@@ -421,7 +473,7 @@ class OliveYoungReviewGUI:
                             if page == 1:
                                 self.log("첫 페이지 요청에 실패했습니다.")
                                 return []
-                        time.sleep(5)  # 5초 대기
+                        time.sleep(random.uniform(8, 12))  # 8~12초 랜덤 대기
                         continue
                 
                 try:
@@ -440,10 +492,17 @@ class OliveYoungReviewGUI:
                             if idx <= 3:  # 처음 3개만 표시
                                 self.log(f"  - 리뷰 {idx}: {review.get('gdasScrVal')}점, {review.get('mbrNickNm')}, 작성일: {review.get('dispRegDate')}")
                         
-                        # 진행률 업데이트
+                        # 진행률 업데이트 (GUI 스레드에서 실행)
                         progress = (page / total_pages) * 100
-                        self.root.after(0, lambda: self.progress_var.set(progress))
-                        self.root.after(0, lambda: self.status_var.set(f"페이지 {page}/{total_pages} 수집 중..."))
+                        self.root.after(0, lambda p=progress: self.progress_var.set(p))
+                        self.root.after(0, lambda p=page, t=total_pages: self.status_var.set(f"페이지 {p}/{t} 수집 중..."))
+                        
+                        # 진행률 표시 (5% 간격)
+                        if page % progress_interval == 0 or page <= 10:
+                            elapsed_time = time.time() - start_time
+                            remaining_time = (elapsed_time / page) * (total_pages - page)
+                            self.log(f"진행률: {progress:.1f}% ({page}/{total_pages} 페이지)")
+                            self.log(f"경과 시간: {elapsed_time:.1f}초, 남은 예상 시간: {remaining_time:.1f}초")
                         
                         # 만약 현재 페이지에 리뷰가 없거나 예상보다 적으면, 마지막 페이지에 도달한 것
                         if len(reviews_on_page) == 0:
@@ -467,7 +526,7 @@ class OliveYoungReviewGUI:
                             return []
                     
                     if page > 1:  # 첫 페이지가 아니면 API 오류로 간주하고 스킵
-                        time.sleep(5)  # 5초 대기
+                        time.sleep(random.uniform(8, 12))  # 8~12초 랜덤 대기
                         continue
                     else:
                         self.log("API 응답 형식이 예상과 다릅니다.")
@@ -482,18 +541,17 @@ class OliveYoungReviewGUI:
                 
                 # 429 (Too Many Requests) 오류 시 더 오래 대기
                 if response.status_code == 429:
-                    wait_time = 20  # 20초 대기
-                    self.log(f"너무 많은 요청을 보냈습니다. {wait_time}초 대기 후 다시 시도합니다.")
+                    wait_time = random.uniform(25, 35)  # 25~35초 랜덤 대기
+                    self.log(f"너무 많은 요청을 보냈습니다. {wait_time:.1f}초 대기 후 다시 시도합니다.")
                     time.sleep(wait_time)
                     page -= 1  # 같은 페이지 다시 시도
                     continue
                 
                 # 403 (Forbidden) 오류 시 더 오래 대기하고 헤더 변경
                 if response.status_code == 403:
-                    wait_time = 30  # 30초 대기
-                    self.log(f"접근이 거부되었습니다. {wait_time}초 대기 후 다시 시도합니다.")
+                    wait_time = random.uniform(40, 60)  # 40~60초 랜덤 대기
+                    self.log(f"접근이 거부되었습니다. {wait_time:.1f}초 대기 후 다시 시도합니다.")
                     time.sleep(wait_time)
-                    continue
                 
                 # 500번대 서버 오류이면 잠시 대기 후 계속
                 if 500 <= response.status_code < 600:
