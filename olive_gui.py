@@ -6,6 +6,7 @@ import re
 from urllib.parse import urlparse, parse_qs
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QFileDialog, QFrame, QProgressBar, QMessageBox, QScrollArea
 from PySide6.QtCore import Signal, QObject, Slot, Qt
+import configparser # configparser 모듈 임포트
 
 from olive_scraper import ensure_chrome_debug, connect_driver, extract_session_from_driver, fetch_reviews, process_reviews, save_results, wait_for_page_load_and_handle_cloudflare
 
@@ -31,6 +32,9 @@ class OliveScraperGUI(QWidget):
     def __init__(self):
         super().__init__()
         self.input_fields = [] # 동적 입력 필드를 저장할 리스트
+        self.config = configparser.ConfigParser() # configparser 초기화
+        self.settings_file = 'config.ini' # 설정 파일 이름
+        self.load_settings() # 설정 로드
         self.init_ui()
         self.init_logging()
         self.is_running = False
@@ -39,6 +43,19 @@ class OliveScraperGUI(QWidget):
         self.status_update_signal.connect(self.status_label.setText)
         self.progress_update_signal.connect(self.progress_bar.setValue)
         self.message_box_signal.connect(self._show_message_box)
+
+    def load_settings(self):
+        self.config.read(self.settings_file)
+        if 'Settings' not in self.config:
+            self.config['Settings'] = {}
+        self.output_dir = self.config['Settings'].get('output_directory', os.getcwd())
+        self.user_data_dir = self.config['Settings'].get('user_data_directory', '')
+
+    def save_settings(self):
+        self.config['Settings']['output_directory'] = self.output_dir_input.text()
+        self.config['Settings']['user_data_directory'] = self.user_data_dir_input.text()
+        with open(self.settings_file, 'w') as configfile:
+            self.config.write(configfile)
 
     def init_ui(self):
         self.setWindowTitle("올리브영 리뷰 수집기")
@@ -79,7 +96,7 @@ class OliveScraperGUI(QWidget):
 
         output_dir_hbox = QHBoxLayout()
         output_dir_label = QLabel("저장할 폴더:")
-        self.output_dir_input = QLineEdit(os.getcwd())
+        self.output_dir_input = QLineEdit(self.output_dir)
         output_dir_select_btn = QPushButton("찾아보기")
         output_dir_select_btn.clicked.connect(self._select_output_directory)
         output_dir_hbox.addWidget(output_dir_label)
@@ -88,8 +105,8 @@ class OliveScraperGUI(QWidget):
         input_layout.addLayout(output_dir_hbox)
 
         user_data_dir_hbox = QHBoxLayout()
-        user_data_dir_label = QLabel("사용자프로필경로:")
-        self.user_data_dir_input = QLineEdit(r"E:\brwProf\User Data")
+        user_data_dir_label = QLabel("브필경로:")
+        self.user_data_dir_input = QLineEdit(self.user_data_dir)
         user_data_dir_select_btn = QPushButton("찾아보기")
         user_data_dir_select_btn.clicked.connect(self._select_user_data_dir)
         user_data_dir_hbox.addWidget(user_data_dir_label)
@@ -170,7 +187,7 @@ class OliveScraperGUI(QWidget):
         pair_layout.addLayout(product_id_hbox)
 
         # 최대 페이지 수 입력 필드 및 삭제 버튼
-        max_pages_input, max_pages_hbox = self._create_input_field(None, "최대 페이지 수(페이지 1당 리뷰 10개):")
+        max_pages_input, max_pages_hbox = self._create_input_field(None, "최대 페이지 수(페이지 1당 리뷰 10개, Max 100):")
         max_pages_input.setText(str(default_max_pages))
 
         delete_button = QPushButton("삭제")
@@ -208,11 +225,13 @@ class OliveScraperGUI(QWidget):
         dir_path = QFileDialog.getExistingDirectory(self, "추출데이터 저장 경로 선택", self.output_dir_input.text())
         if dir_path:
             self.output_dir_input.setText(dir_path)
+            self.save_settings() # 설정 저장
 
     def _select_user_data_dir(self):
         dir_path = QFileDialog.getExistingDirectory(self, "사용자 프로필 경로 선택", self.user_data_dir_input.text())
         if dir_path:
             self.user_data_dir_input.setText(dir_path)
+            self.save_settings() # 설정 저장
 
     def init_logging(self):
         self.log_handler = StreamHandler()
@@ -415,7 +434,7 @@ class OliveScraperGUI(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyleSheet("QWidget { font-size: 12pt; }")
+    app.setStyleSheet("QWidget { font-size: 14pt; }") # 폰트 사이즈 14pt로 변경
     gui = OliveScraperGUI()
     gui.show()
     sys.exit(app.exec()) 
