@@ -1,693 +1,325 @@
 import sys
-import subprocess
 import os
-import time
-import json
-import random
-import requests
 import threading
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-from datetime import datetime
-import traceback
-from seleniumbase import SB
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import logging
+import re
+from urllib.parse import urlparse, parse_qs
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QFileDialog, QFrame, QProgressBar, QMessageBox
+from PySide6.QtCore import Signal, QObject, Slot, Qt
 
-class OliveYoungReviewGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("올리브영 리뷰 수집기")
-        self.root.geometry("600x700")
-        self.root.resizable(True, True)
+from olive_scraper import scrape_reviews
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class StreamHandler(logging.Handler, QObject):
+    log_signal = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        QObject.__init__(self)
+
+    def emit(self, record):
+        msg = self.format(record)
+        self.log_signal.emit(msg)
+
+class OliveScraperGUI(QWidget):
+    status_update_signal = Signal(str)
+    progress_update_signal = Signal(int)
+    message_box_signal = Signal(str, str, str) # type, title, message
+
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
+        self.init_logging()
+        self.is_running = False
+
+        self.status_update_signal.connect(self.status_label.setText)
+        self.progress_update_signal.connect(self.progress_bar.setValue)
+        self.message_box_signal.connect(self._show_message_box)
+
+    def init_ui(self):
+        self.setWindowTitle("올리브영 리뷰 수집기")
+        self.setGeometry(100, 100, 800, 700)
+
+        main_layout = QVBoxLayout()
+
+        title_label = QLabel("올리브영 리뷰 수집기1.3 - by 꼬질강쥐")
+        title_label.setStyleSheet("font-size: 16pt; font-weight: bold;")
+        title_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(title_label)
         
-        # 필요한 패키지 설치 확인
-        self.check_packages()
+        input_frame = QFrame()
+        input_frame.setFrameShape(QFrame.StyledPanel)
+        input_layout = QVBoxLayout()
+        input_frame.setLayout(input_layout)
         
-        # UI 구성
-        self.create_widgets()
-    
-    def check_packages(self):
-        try:
-            import pandas as pd
-            from seleniumbase import SB
-            import requests
-        except ImportError:
-            if messagebox.askyesno("패키지 설치", "필요한 패키지(pandas, openpyxl, seleniumbase, requests)를 설치해야 합니다. 지금 설치하시겠습니까?"):
-                self.install_packages()
-    
-    def install_packages(self):
-        def run_install():
-            try:
-                packages = ['pandas', 'openpyxl', 'seleniumbase', 'requests']
-                for package in packages:
-                    subprocess.check_call([sys.executable, '-m', 'pip', 'install', package])
-                messagebox.showinfo("설치 완료", "필요한 패키지 설치가 완료되었습니다.")
-            except Exception as e:
-                messagebox.showerror("설치 오류", f"패키지 설치 중 오류가 발생했습니다:\n{str(e)}")
+        self.product_id_input = self._create_input_field(input_layout, "상품 ID 또는 URL전체 복붙:")
+        self.product_id_input.setText("A000000213959")
         
-        # 별도 스레드에서 설치 실행
-        install_thread = threading.Thread(target=run_install)
-        install_thread.daemon = True
-        install_thread.start()
-    
-    def create_widgets(self):
-        # 메인 프레임
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        product_id_hint = QLabel("예: A000000159233 또는 상품페이지 URL")
+        # product_id_hint.setStyleSheet("font-size: 9pt;")
+        hint_hbox = QHBoxLayout()
+        hint_hbox.addStretch(1)
+        hint_hbox.addWidget(product_id_hint)
+        input_layout.addLayout(hint_hbox)
+
+        self.max_pages_input = self._create_input_field(input_layout, "최대 페이지 수(페이지 1당 리뷰 10개, Max 100):")
+        self.max_pages_input.setText("100")
         
-        # 제목
-        title_label = ttk.Label(main_frame, text="올리브영 리뷰 수집기1.2 - by 꼬질강쥐", font=("Malgun Gothic", 16, "bold"))
-        title_label.pack(pady=10)
+        output_format_label = QLabel("출력 형식: 엑셀(.xlsx)과 JSON 파일 모두 저장됩니다")
+        # output_format_label.setStyleSheet("font-size: 12pt;")
+        format_hbox = QHBoxLayout()
+        format_hbox.addStretch(1)
+        format_hbox.addWidget(output_format_label)
+        input_layout.addLayout(format_hbox)
+
+        output_dir_hbox = QHBoxLayout()
+        output_dir_label = QLabel("추출데이터 저장 경로:")
+        self.output_dir_input = QLineEdit(os.getcwd())
+        output_dir_select_btn = QPushButton("찾아보기")
+        output_dir_select_btn.clicked.connect(self._select_output_directory)
+        output_dir_hbox.addWidget(output_dir_label)
+        output_dir_hbox.addWidget(self.output_dir_input)
+        output_dir_hbox.addWidget(output_dir_select_btn)
+        input_layout.addLayout(output_dir_hbox)
+
+        # Chrome 사용자 데이터 디렉토리 입력은 유지
+        user_data_dir_hbox = QHBoxLayout()
+        user_data_dir_label = QLabel("사용자프로필경로:")
+        self.user_data_dir_input = QLineEdit(r"E:\brwProf\User Data")
+        user_data_dir_select_btn = QPushButton("찾아보기")
+        user_data_dir_select_btn.clicked.connect(self._select_user_data_dir)
+        user_data_dir_hbox.addWidget(user_data_dir_label)
+        user_data_dir_hbox.addWidget(self.user_data_dir_input)
+        user_data_dir_hbox.addWidget(user_data_dir_select_btn)
+        input_layout.addLayout(user_data_dir_hbox)
+
+        main_layout.addWidget(input_frame)
+
+        button_frame = QHBoxLayout()
+        self.start_button = QPushButton("리뷰 수집 시작")
+        self.start_button.clicked.connect(self.start_collection)
+        button_frame.addStretch(1)
+        button_frame.addWidget(self.start_button)
+        button_frame.addStretch(1)
         
-        # 입력 영역 프레임
-        input_frame = ttk.LabelFrame(main_frame, text="설정", padding="10")
-        input_frame.pack(fill=tk.X, padx=5, pady=5)
+        main_layout.addLayout(button_frame)
+
+        progress_frame = QFrame()
+        progress_frame.setFrameShape(QFrame.StyledPanel)
+        progress_layout = QVBoxLayout()
+        progress_frame.setLayout(progress_layout)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        progress_layout.addWidget(self.progress_bar)
+
+        self.status_label = QLabel("준비 완료")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        progress_layout.addWidget(self.status_label)
+
+        main_layout.addWidget(progress_frame)
+
+        log_frame = QFrame()
+        log_frame.setFrameShape(QFrame.StyledPanel)
+        log_layout = QVBoxLayout()
+        log_frame.setLayout(log_layout)
         
-        # 상품 ID 입력
-        ttk.Label(input_frame, text="상품 ID:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.product_id_var = tk.StringVar()
-        ttk.Entry(input_frame, textvariable=self.product_id_var, width=30).grid(row=0, column=1, sticky=tk.W, pady=5)
-        ttk.Label(input_frame, text="예: A000000159233").grid(row=0, column=2, sticky=tk.W, pady=5, padx=5)
+        log_layout.addWidget(QLabel("로그:"))
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        log_layout.addWidget(self.log_output)
+
+        main_layout.addWidget(log_frame)
+
+        bottom_button_frame = QHBoxLayout()
+        self.stop_button = QPushButton("중지")
+        self.stop_button.clicked.connect(self.stop_collection)
+        self.stop_button.setEnabled(False)
+        bottom_button_frame.addWidget(self.stop_button)
         
-        # 최대 페이지 수 입력
-        ttk.Label(input_frame, text="최대 페이지 수:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.max_pages_var = tk.IntVar(value=100)
-        pages_spin = ttk.Spinbox(input_frame, from_=1, to=1000, textvariable=self.max_pages_var, width=10)
-        pages_spin.grid(row=1, column=1, sticky=tk.W, pady=5)
-        
-        # 출력 형식 안내
-        ttk.Label(input_frame, text="출력 형식:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        ttk.Label(input_frame, text="엑셀(.xlsx)과 JSON 파일 모두 저장됩니다", font=("Malgun Gothic", 9)).grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=5)
-        
-        # 저장 경로 선택
-        ttk.Label(input_frame, text="저장 경로:").grid(row=3, column=0, sticky=tk.W, pady=5)
-        self.save_path_var = tk.StringVar(value=os.getcwd())
-        path_entry = ttk.Entry(input_frame, textvariable=self.save_path_var, width=30)
-        path_entry.grid(row=3, column=1, sticky=tk.W, pady=5)
-        ttk.Button(input_frame, text="찾아보기", command=self.browse_save_path).grid(row=3, column=2, sticky=tk.W, pady=5, padx=5)
-        
-        # 버튼 영역
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill=tk.X, padx=5, pady=10)
-        
-        # 실행 버튼
-        self.start_button = ttk.Button(button_frame, text="리뷰 수집 시작", command=self.start_collection)
-        self.start_button.pack(side=tk.RIGHT, padx=5)
-        
-        # 진행 상황 표시
-        progress_frame = ttk.LabelFrame(main_frame, text="진행 상황", padding="10")
-        progress_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(fill=tk.X, padx=5, pady=5)
-        
-        self.status_var = tk.StringVar(value="준비 완료")
-        status_label = ttk.Label(progress_frame, textvariable=self.status_var)
-        status_label.pack(fill=tk.X, padx=5)
-        
-        # 로그 출력 영역
-        log_frame = ttk.LabelFrame(main_frame, text="로그", padding="10")
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        self.log_text = tk.Text(log_frame, wrap=tk.WORD, height=15)
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_text.config(yscrollcommand=scrollbar.set)
-        
-        # 하단 버튼 영역
-        bottom_frame = ttk.Frame(main_frame)
-        bottom_frame.pack(fill=tk.X, padx=5, pady=10)
-        
-        self.stop_button = ttk.Button(bottom_frame, text="중지", command=self.stop_collection, state=tk.DISABLED)
-        self.stop_button.pack(side=tk.RIGHT, padx=5)
-        
-        self.open_folder_button = ttk.Button(bottom_frame, text="저장 폴더 열기", command=self.open_save_folder)
-        self.open_folder_button.pack(side=tk.LEFT, padx=5)
-        
-        # 초기 메시지
-        self.log("올리브영 리뷰 수집기가 시작되었습니다.")
-        self.log("상품 ID를 입력하고 '리뷰 수집 시작' 버튼을 클릭하세요.")
-    
-    def browse_save_path(self):
-        folder_path = filedialog.askdirectory(initialdir=self.save_path_var.get())
-        if folder_path:
-            self.save_path_var.set(folder_path)
-    
-    def open_save_folder(self):
-        path = self.save_path_var.get()
-        if os.path.exists(path):
-            if sys.platform == 'win32':
-                os.startfile(path)
-            elif sys.platform == 'darwin':  # macOS
-                subprocess.Popen(['open', path])
-            else:  # Linux
-                subprocess.Popen(['xdg-open', path])
-        else:
-            messagebox.showerror("오류", "지정된 경로가 존재하지 않습니다.")
-    
-    def log(self, message):
-        self.log_text.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n")
-        self.log_text.see(tk.END)
-    
+        self.open_folder_button = QPushButton("저장 폴더 열기")
+        self.open_folder_button.clicked.connect(self.open_save_folder)
+        bottom_button_frame.addWidget(self.open_folder_button)
+
+        main_layout.addLayout(bottom_button_frame)
+
+        self.setLayout(main_layout)
+
+        self.log_output.append("올리브영 리뷰 수집기가 시작되었습니다.")
+        self.log_output.append("상품 ID 또는 URL을 입력하고 '리뷰 수집 시작' 버튼을 클릭하세요.")
+
+    def _create_input_field(self, layout, label_text):
+        hbox = QHBoxLayout()
+        label = QLabel(label_text)
+        line_edit = QLineEdit()
+        hbox.addWidget(label)
+        hbox.addWidget(line_edit)
+        layout.addLayout(hbox)
+        return line_edit
+
+    def _select_output_directory(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "출력 디렉토리 선택", self.output_dir_input.text())
+        if dir_path:
+            self.output_dir_input.setText(dir_path)
+
+    def _select_user_data_dir(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Chrome 사용자 데이터 디렉토리 선택", self.user_data_dir_input.text())
+        if dir_path:
+            self.user_data_dir_input.setText(dir_path)
+
+    def init_logging(self):
+        self.log_handler = StreamHandler()
+        self.log_handler.log_signal.connect(self.update_log_output)
+        logging.getLogger().addHandler(self.log_handler)
+
+    @Slot(str)
+    def update_log_output(self, msg):
+        self.log_output.append(msg)
+        self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
+
+    @Slot(str, str, str)
+    def _show_message_box(self, type: str, title: str, message: str):
+        if type == "warning":
+            QMessageBox.warning(self, title, message)
+        elif type == "critical":
+            QMessageBox.critical(self, title, message)
+        elif type == "information":
+            QMessageBox.information(self, title, message)
+
     def start_collection(self):
-        # 입력 검증
-        product_id = self.product_id_var.get().strip()
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.log_output.clear()
+        self.log_output.append("리뷰 수집을 시작합니다...")
+        self.status_update_signal.emit("수집 준비 중...")
+        self.progress_update_signal.emit(0)
+
+        input_value = self.product_id_input.text().strip()
+        if not input_value:
+            self.message_box_signal.emit("warning", "입력 오류", "상품 ID 또는 URL을 입력해주세요.")
+            self.update_log_output("오류: 상품 ID 또는 URL을 입력해주세요.")
+            self.status_update_signal.emit("오류 발생")
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            return
+
+        product_id = self.extract_product_id(input_value)
         if not product_id:
-            messagebox.showerror("입력 오류", "상품 ID를 입력해주세요.")
+            self.message_box_signal.emit("warning", "입력 오류", "유효한 상품 ID 또는 올리브영 URL을 입력해주세요.")
+            self.update_log_output("오류: 유효한 상품 ID 또는 올리브영 URL을 입력해주세요.")
+            self.status_update_signal.emit("오류 발생")
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
             return
         
-        save_path = self.save_path_var.get()
-        if not os.path.exists(save_path):
-            messagebox.showerror("경로 오류", "지정된 저장 경로가 존재하지 않습니다.")
+        max_pages_str = self.max_pages_input.text()
+        try:
+            max_pages = int(max_pages_str)
+            if max_pages <= 0:
+                raise ValueError("페이지 수는 1 이상이어야 합니다.")
+        except ValueError as e:
+            self.message_box_signal.emit("warning", "입력 오류", f"최대 페이지 수 입력이 잘못되었습니다. {e}")
+            self.update_log_output(f"오류: 최대 페이지 수 입력이 잘못되었습니다. {e}")
+            self.status_update_signal.emit("오류 발생")
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
             return
+
+        out_dir = self.output_dir_input.text()
+        if not os.path.exists(out_dir):
+            try:
+                os.makedirs(out_dir)
+            except OSError as e:
+                self.message_box_signal.emit("critical", "오류", f"출력 디렉토리를 생성할 수 없습니다: {e}")
+                self.update_log_output(f"오류: 출력 디렉토리를 생성할 수 없습니다: {e}")
+                self.status_update_signal.emit("오류 발생")
+                self.start_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
+                return
         
-        # 버튼 상태 변경
-        self.start_button.config(state=tk.DISABLED)
-        self.stop_button.config(state=tk.NORMAL)
-        
-        # 수집 시작 메시지
-        self.log(f"상품 ID '{product_id}'의 리뷰 수집을 시작합니다.")
-        self.log(f"최대 {self.max_pages_var.get()}페이지까지 수집합니다.")
-        
-        # 수집 스레드 시작
+        user_data_dir = self.user_data_dir_input.text()
+        chrome_main_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe" # 고정된 값
+        port = "9222" # 고정된 값
+
         self.is_running = True
-        self.collection_thread = threading.Thread(target=self.run_collection)
-        self.collection_thread.daemon = True
-        self.collection_thread.start()
-    
+        threading.Thread(target=self._run_scraper_thread, args=(
+            product_id, max_pages, out_dir, user_data_dir, chrome_main_path, port
+        )).start()
+
+    def _run_scraper_thread(self, product_id, max_pages, out_dir, user_data_dir, chrome_main_path, port):
+        try:
+            scrape_reviews(
+                product_id=product_id,
+                max_pages=max_pages,
+                out_dir=out_dir,
+                port=int(port), # port를 int로 변환하여 전달
+                user_data_dir=user_data_dir,
+                chrome_main_path=chrome_main_path,
+                log_callback=self.update_log_output,
+                stop_check_callback=lambda: not self.is_running
+            )
+            if self.is_running:
+                self.update_log_output("리뷰 수집이 완료되었습니다.")
+                self.status_update_signal.emit("완료")
+                self.progress_update_signal.emit(100)
+                self.message_box_signal.emit("information", "수집 완료", "리뷰 수집이 완료되었습니다.")
+        except Exception as e:
+            self.update_log_output(f"오류 발생: {e}")
+            self.status_update_signal.emit("오류 발생")
+            self.message_box_signal.emit("critical", "오류", f"리뷰 수집 중 오류가 발생했습니다:\n{e}")
+        finally:
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            self.is_running = False
+
     def stop_collection(self):
         self.is_running = False
-        self.log("리뷰 수집이 중지되었습니다.")
-        self.status_var.set("중지됨")
-        self.start_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
-    
-    def run_collection(self):
-        try:
-            # 설정값 가져오기
-            product_id = self.product_id_var.get().strip()
-            max_pages = self.max_pages_var.get()
-            save_path = self.save_path_var.get()
-            
-            # 원래 작업 디렉토리 저장
-            original_dir = os.getcwd()
-            
-            # 저장 경로로 이동
-            os.chdir(save_path)
-            
-            # 리뷰 수집 시작
-            self.status_var.set("리뷰 데이터 수집 중...")
-            reviews = self.get_reviews(product_id, max_pages)
-            
-            if not self.is_running:
-                os.chdir(original_dir)
-                return
-            
-            if not reviews:
-                self.log("수집된 리뷰가 없습니다.")
-                messagebox.showinfo("알림", "수집된 리뷰가 없습니다.")
-                self.status_var.set("완료 (수집된 리뷰 없음)")
-                self.start_button.config(state=tk.NORMAL)
-                self.stop_button.config(state=tk.DISABLED)
-                os.chdir(original_dir)
-                return
-            
-            self.log(f"총 {len(reviews)}개의 리뷰를 수집했습니다. 데이터 처리 중...")
-            
-            # 현재 날짜와 시간을 파일명에 포함
-            date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            # JSON 형식으로 원본 데이터 저장
-            self.status_var.set("원본 데이터 저장 중...")
-            json_filename = f'올리브영_리뷰_원본_{product_id}_{date_str}.json'
-            with open(json_filename, 'w', encoding='utf-8') as f:
-                json.dump(reviews, f, ensure_ascii=False, indent=2)
-            self.log(f"원본 리뷰 데이터를 '{json_filename}' 파일로 저장했습니다.")
-            
-            if not self.is_running:
-                os.chdir(original_dir)
-                return
-            
-            # 리뷰 데이터 처리
-            self.status_var.set("리뷰 데이터 처리 중...")
-            df = self.process_reviews(reviews)
-            
-            if df.empty:
-                self.log("처리된 리뷰 데이터가 없습니다.")
-                messagebox.showinfo("알림", "처리된 리뷰 데이터가 없습니다.")
-                self.status_var.set("완료 (처리된 데이터 없음)")
-                self.start_button.config(state=tk.NORMAL)
-                self.stop_button.config(state=tk.DISABLED)
-                os.chdir(original_dir)
-                return
-            
-            if not self.is_running:
-                os.chdir(original_dir)
-                return
-            
-            # 결과 저장 (JSON과 엑셀 둘 다 저장)
-            self.status_var.set("결과 저장 중...")
-            
-            # 엑셀 파일 저장
-            excel_filename = f'올리브영_리뷰_{product_id}_{date_str}.xlsx'
-            df.to_excel(excel_filename, index=False, engine='openpyxl')
-            self.log(f"엑셀 파일: '{excel_filename}' 저장 완료")
-            
-            # JSON 파일 저장
-            json_processed_filename = f'올리브영_리뷰_가공_{product_id}_{date_str}.json'
-            df.to_json(json_processed_filename, force_ascii=False, orient='records', indent=2)
-            self.log(f"JSON 파일: '{json_processed_filename}' 저장 완료")
-            
-            self.log(f"총 {len(df)}개의 리뷰를 엑셀과 JSON 파일로 저장했습니다.")
-            self.log(f"파일 위치: {os.path.abspath(excel_filename)}")
-            
-            # 완료 처리
-            self.root.after(0, lambda: self.progress_var.set(100))
-            self.root.after(0, lambda: self.status_var.set(f"완료 ({len(df)}개 리뷰 저장)"))
-            
-            # GUI 업데이트를 위한 짧은 대기
-            time.sleep(0.5)
-            
-            # 완료 메시지 표시
-            self.root.after(0, lambda: messagebox.showinfo("완료", f"총 {len(df)}개의 리뷰 수집이 완료되었습니다.\n\n파일 저장 위치:\n{os.path.abspath(excel_filename)}"))
-            
-            # 원래 디렉토리로 돌아감
-            os.chdir(original_dir)
-            
-        except Exception as e:
-            self.log(f"오류 발생: {str(e)}")
-            self.root.after(0, lambda: self.status_var.set("오류 발생"))
-            self.root.after(0, lambda: messagebox.showerror("오류", f"리뷰 수집 중 오류가 발생했습니다:\n{str(e)}"))
-            # 원래 디렉토리로 돌아감 (오류 시에도)
-            try:
-                os.chdir(original_dir)
-            except:
-                pass
-        finally:
-            # GUI 업데이트를 메인 스레드에서 실행
-            self.root.after(0, lambda: self.start_button.config(state=tk.NORMAL))
-            self.root.after(0, lambda: self.stop_button.config(state=tk.DISABLED))
-    
-    # 임의의 User-Agent 생성 함수 (더 이상 사용되지 않음)
-    def get_random_user_agent(self):
-        user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0'
-        ]
-        return random.choice(user_agents)
-    
-    # 셀레니움을 사용하여 최신 쿠키와 헤더 가져오기
-    def get_reviews(self, product_id, total_pages=100):
-        all_reviews = []
-        
-        # 세션 생성 - 쿠키 유지
-        session = requests.Session()
-        
-        # 직접 Selenium을 사용하여 최신 쿠키와 헤더 가져오기
-        self.log("Selenium을 사용하여 최신 인증 정보 획득 중...")
-        try:
-            with SB(uc=True, headless=False) as sb:
-                # 상품 페이지로 이동하여 쿠키 획득
-                product_url = f'https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo={product_id}'
-                sb.open(product_url)
-                
-                self.log("캡차(CAPTCHA)가 나타나면 5분 안에 해결해주세요...")
-                self.log("캡차 해결 후 상품 정보가 완전히 로드될 때까지 기다립니다...")
-                
-                # 캡차 해결 후 실제 콘텐츠가 로드되는 것을 기다림
-                # 여러 가능한 요소들을 순서대로 확인
-                content_loaded = False
-                try:
-                    # 1. 리뷰 영역 확인 (가장 확실한 방법)
-                    if sb.is_element_present("#gdasContents"):
-                        sb.wait_for_element_visible("#gdasContents", timeout=300)
-                        content_loaded = True
-                        self.log("리뷰 영역이 로드되었습니다.")
-                    # 2. 상품 정보 영역 확인
-                    elif sb.is_element_present(".prd_detail_box"):
-                        sb.wait_for_element_visible(".prd_detail_box", timeout=300)
-                        content_loaded = True
-                        self.log("상품 정보 영역이 로드되었습니다.")
-                    # 3. 상품 이미지 영역 확인
-                    elif sb.is_element_present(".prd_img"):
-                        sb.wait_for_element_visible(".prd_img", timeout=300)
-                        content_loaded = True
-                        self.log("상품 이미지 영역이 로드되었습니다.")
-                    # 4. 기본 대기 (위 요소들이 없는 경우)
-                    else:
-                        self.log("기본 페이지 로드 대기 중...")
-                        sb.sleep(10)  # 10초 기본 대기
-                        content_loaded = True
-                        
-                except Exception as wait_error:
-                    self.log(f"콘텐츠 로드 대기 중 오류: {wait_error}")
-                    self.log("수동으로 캡차를 해결하고 Enter 키를 눌러주세요...")
-                    
-                    # 사용자가 수동으로 캡차를 해결할 시간 제공
-                    for i in range(30):  # 30초 동안 1초씩 확인
-                        sb.sleep(1)
-                        if sb.is_element_present("#gdasContents") or sb.is_element_present(".prd_detail_box"):
-                            content_loaded = True
-                            self.log("콘텐츠가 로드되었습니다!")
-                            break
-                        if i % 5 == 0:  # 5초마다 안내 메시지
-                            remaining = 30 - i
-                            self.log(f"캡차 해결 대기 중... (남은 시간: {remaining}초)")
-                
-                if not content_loaded:
-                    self.log("⚠️ 콘텐츠 로드를 확인할 수 없습니다.")
-                    self.log("캡차가 해결되었다면 계속 진행합니다.")
-                
-                # 추가 안정성을 위한 대기
-                sb.sleep(3)
+        self.update_log_output("리뷰 수집이 중지되었습니다.")
+        self.status_update_signal.emit("중지됨")
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
 
-                # 쿠키와 헤더 정보 추출
-                cookies = sb.get_cookies()
-                cookie_dict = {c['name']: c['value'] for c in cookies}
-                
-                user_agent = sb.get_user_agent()
-                
-                # 쿠키를 세션에 적용
-                for cookie in cookies:
-                    session.cookies.set(cookie['name'], cookie['value'])
-                
-                self.log("인증 정보 획득 완료. 브라우저를 닫고 리뷰 수집을 시작합니다.")
-                
-        except Exception as e:
-            self.log(f"Selenium 인증 정보 획득 실패: {e}")
-            traceback.print_exc()
-            return []
-
-        # 진행 상황 표시 변수
-        progress_interval = max(1, total_pages // 20)  # 5% 간격으로 진행 상황 표시
-        start_time = time.time()
-        
-        for page in range(1, total_pages + 1):
-            # 수집 중지 확인
-            if not self.is_running:
-                self.log("사용자에 의해 수집이 중지되었습니다.")
-                break
-            
-            # 헤더 설정 - 매 요청마다 약간 다르게 설정
-            headers = {
-                'User-Agent': user_agent,
-                'Referer': f'https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo={product_id}',
-                'Accept': '*/*',
-                'Accept-Language': 'ko,en;q=0.9,en-US;q=0.8',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache',
-                'X-Requested-With': 'XMLHttpRequest',
-                'sec-ch-ua': '"Microsoft Edge";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
-                'sec-fetch-dest': 'empty',
-                'sec-fetch-mode': 'cors',
-                'sec-fetch-site': 'same-origin'
-            }
-            
-            # API URL 및 파라미터 설정
-            url = "https://www.oliveyoung.co.kr/store/goods/getGdasNewListJson.do"
-            
-            params = {
-                'goodsNo': product_id,
-                'gdasSort': '05',  # 최신순
-                'itemNo': 'all_search',
-                'pageIdx': page,
-                'colData': '',
-                'keywordGdasSeqs': '',
-                'type': '',
-                'point': '',
-                'hashTag': '',
-                'optionValue': '',
-                'cTypeLength': '0'
-            }
-            
-            # 재시도 로직 강화
-            max_retries = 3
-            retry_count = 0
-            
-            while retry_count < max_retries:
-                try:
-                    # API 호출 (SSL 검증 비활성화)
-                    response = session.get(url, params=params, headers=headers, timeout=20, verify=False)
-                    
-                    # 응답이 성공적이면 반복문 종료
-                    if response.status_code == 200:
-                        break
-                        
-                    # 오류 발생 시 대기 시간 증가 및 재시도
-                    retry_count += 1
-                    time.sleep(random.uniform(3, 6))  # 3~6초 랜덤 대기
-                    
-                except Exception as e:
-                    self.log(f"페이지 {page} 요청 중 오류, 재시도 {retry_count+1}/{max_retries}: {e}")
-                    retry_count += 1
-                    time.sleep(random.uniform(8, 12))  # 8~12초 랜덤 대기
-                    continue
-            
-            # 서버 부하 방지 대기 시간을 더 일관되게 설정
-            time.sleep(random.uniform(1.5, 2.5))  # 1.5~2.5초 랜덤 대기
-            
-            # 응답 확인
-            if response.status_code == 200:
-                # 응답 타입 확인
-                content_type = response.headers.get('Content-Type', '')
-                if 'application/json' not in content_type and 'text/json' not in content_type and 'text/plain' not in content_type:
-                    if '<html' in response.text.lower():
-                        self.log(f"페이지 {page}의 응답이 HTML 형식입니다. API가 차단되었을 수 있습니다.")
-                        if page <= 2:
-                            self.log("=== 도움말 ===")
-                            self.log("1. 올리브영 웹사이트에 직접 접속해 로그인을 시도해 보세요.")
-                            self.log("2. 웹사이트에서 캡차(CAPTCHA) 인증이 필요할 수 있습니다.")
-                            self.log("3. VPN이나 프록시를 사용 중이라면 해제해 보세요.")
-                            self.log("4. 잠시 후에 다시 시도해 보세요.")
-                            self.log("============")
-                            
-                            if page == 1:
-                                self.log("첫 페이지 요청에 실패했습니다.")
-                                return []
-                        time.sleep(random.uniform(8, 12))  # 8~12초 랜덤 대기
-                        continue
-                
-                try:
-                    data = response.json()
-                    
-                    # 올리브영 API 응답 구조에 맞게 리뷰 데이터 추출
-                    if 'gdasList' in data:
-                        reviews_on_page = data['gdasList']
-                        all_reviews.extend(reviews_on_page)
-                        
-                        # 현재 페이지 리뷰 정보 출력
-                        self.log(f"페이지 {page}: {len(reviews_on_page)}개의 리뷰를 수집했습니다. (총 {len(all_reviews)}개)")
-                        
-                        # 각 리뷰 정보 간략히 출력
-                        for idx, review in enumerate(reviews_on_page, 1):
-                            if idx <= 3:  # 처음 3개만 표시
-                                self.log(f"  - 리뷰 {idx}: {review.get('gdasScrVal')}점, {review.get('mbrNickNm')}, 작성일: {review.get('dispRegDate')}")
-                        
-                        # 진행률 업데이트 (GUI 스레드에서 실행)
-                        progress = (page / total_pages) * 100
-                        self.root.after(0, lambda p=progress: self.progress_var.set(p))
-                        self.root.after(0, lambda p=page, t=total_pages: self.status_var.set(f"페이지 {p}/{t} 수집 중..."))
-                        
-                        # 진행률 표시 (5% 간격)
-                        if page % progress_interval == 0 or page <= 10:
-                            elapsed_time = time.time() - start_time
-                            remaining_time = (elapsed_time / page) * (total_pages - page)
-                            self.log(f"진행률: {progress:.1f}% ({page}/{total_pages} 페이지)")
-                            self.log(f"경과 시간: {elapsed_time:.1f}초, 남은 예상 시간: {remaining_time:.1f}초")
-                        
-                        # 만약 현재 페이지에 리뷰가 없거나 예상보다 적으면, 마지막 페이지에 도달한 것
-                        if len(reviews_on_page) == 0:
-                            self.log(f"마지막 페이지 ({page})에 도달했습니다. 총 {len(all_reviews)}개의 리뷰를 수집했습니다.")
-                            break
-                    else:
-                        self.log(f"페이지 {page}에서 리뷰 데이터를 찾을 수 없습니다.")
-                        self.log(f"응답: {json.dumps(data, ensure_ascii=False, indent=2)[:200]}...")
-                        # API 응답에 gdasList가 없으면 마지막 페이지로 간주
-                        break
-                except json.JSONDecodeError:
-                    self.log(f"페이지 {page}의 응답을 JSON으로 파싱할 수 없습니다.")
-                    self.log(f"응답 내용 일부: {response.text[:100]}")
-                    
-                    # HTML 응답인지 확인
-                    if '<html' in response.text.lower():
-                        self.log("응답이 HTML 형식입니다. API가 차단되었거나 로그인이 필요할 수 있습니다.")
-                        # 첫 페이지에서 이런 일이 발생하면 종료
-                        if page <= 3:
-                            self.log("초기 페이지에서 오류가 발생했습니다.")
-                            return []
-                    
-                    if page > 1:  # 첫 페이지가 아니면 API 오류로 간주하고 스킵
-                        time.sleep(random.uniform(8, 12))  # 8~12초 랜덤 대기
-                        continue
-                    else:
-                        self.log("API 응답 형식이 예상과 다릅니다.")
-                        return []
-            else:
-                self.log(f"페이지 {page} 요청 실패: 상태 코드 {response.status_code}")
-                
-                try:
-                    self.log(f"응답: {response.text[:200]}...")  # 응답의 처음 200자만 출력
-                except:
-                    self.log("응답 내용을 표시할 수 없습니다.")
-                
-                # 429 (Too Many Requests) 오류 시 더 오래 대기
-                if response.status_code == 429:
-                    wait_time = random.uniform(25, 35)  # 25~35초 랜덤 대기
-                    self.log(f"너무 많은 요청을 보냈습니다. {wait_time:.1f}초 대기 후 다시 시도합니다.")
-                    time.sleep(wait_time)
-                    page -= 1  # 같은 페이지 다시 시도
-                    continue
-                
-                # 403 (Forbidden) 오류 시 더 오래 대기하고 헤더 변경
-                if response.status_code == 403:
-                    wait_time = random.uniform(40, 60)  # 40~60초 랜덤 대기
-                    self.log(f"접근이 거부되었습니다. {wait_time:.1f}초 대기 후 다시 시도합니다.")
-                    time.sleep(wait_time)
-                
-                # 500번대 서버 오류이면 잠시 대기 후 계속
-                if 500 <= response.status_code < 600:
-                    time.sleep(5)
-                    continue
-            
-            # 진행 상황 표시
-            if page % progress_interval == 0 or page == total_pages:
-                progress = (page / total_pages) * 100
-                elapsed = time.time() - start_time
-                estimated_total = elapsed / (page / total_pages)
-                remaining = estimated_total - elapsed
-                
-                self.log(f"진행률: {progress:.1f}% ({page}/{total_pages} 페이지)")
-                self.log(f"경과 시간: {elapsed:.1f}초, 남은 예상 시간: {remaining:.1f}초")
-                
-            # 서버 부하 방지를 위한 대기 시간
-            time.sleep(random.uniform(1, 1.5))  # 0.2~0.8초 대기
-                
-        return all_reviews
-    
-    # 리뷰 데이터 처리 및 저장
-    def process_reviews(self, reviews):
-        import pandas as pd
-        processed_data = []
-        
-        for review in reviews:
+    def open_save_folder(self):
+        path = self.output_dir_input.text()
+        if os.path.exists(path):
             try:
-                # 기본 리뷰 정보 추출
-                nickname = review.get('mbrNickNm', '')
-                user_id = review.get('mbrId', '')
-                if not user_id:
-                    user_id = '알 수 없음'
-                    
-                # 닉네임이 없는 경우 아이디 값 사용
-                if not nickname:
-                    nickname = user_id
-                
-                # 평점
-                rating = review.get('gdasScrVal', 0)
-                # 평점 변환 (10점 만점 → 5점 만점)
-                converted_rating = rating / 2
-                
-                # 작성일
-                date = review.get('dispRegDate', '')
-                
-                # 리뷰 내용
-                content = review.get('gdasCont', '').replace('<br/>', '\n').strip()
-                
-                # 구매 옵션
-                option = review.get('itemNm', '')
-                
-                # 리뷰 형태 판별 (포토리뷰/일반리뷰)
-                review_type = "일반리뷰"
-                
-                # 사진 여부 확인
-                has_photo = False
-                photo_urls = []
-                photo_list = review.get('photoList', [])
-                if photo_list and len(photo_list) > 0:
-                    has_photo = True
-                    review_type = "포토리뷰"
-                    # 전체 URL로 이미지 경로 구성
-                    for photo in photo_list:
-                        file_path = photo.get('appxFilePathNm', '')
-                        if file_path:
-                            full_url = f"https://image.oliveyoung.co.kr/uploads/images/gdasEditor/{file_path}"
-                            photo_urls.append(full_url)
-                
-                # 도움이 돼요 수
-                help_count = review.get('recommCnt', 0)
-                
-                # 회원 랭킹 정보 추출
-                rank_info = "일반"
-                top_reviewer_rank = review.get('topRvrRnk', 0)
-                if top_reviewer_rank and top_reviewer_rank > 0:
-                    rank_info = f"TOP {top_reviewer_rank}위"
-                
-                # 피부 정보 추출
-                skin_info = []
-                add_info_list = review.get('addInfoNm', [])
-                if add_info_list:
-                    for info in add_info_list:
-                        skin_info.append(info.get('mrkNm', ''))
-                
-                # 재구매 여부 추출 (firstGdasYn 값이 'N'이면 재구매)
-                repurchase = False
-                if review.get('firstGdasYn') == 'N':
-                    repurchase = True
-                    
-                # 한달이상 사용 여부 추출 (renewUsed1mmGdasYn 값이 'Y'이면 한달 이상 사용)
-                long_use = False
-                if review.get('renewUsed1mmGdasYn') == 'Y':
-                    long_use = True
-                
-                # 오프라인 구매 여부 (ordNo 필드가 'Y'로 시작하지 않으면 오프라인 구매)
-                offline_purchase = False
-                order_no = review.get('ordNo', '')
-                if order_no and not order_no.startswith('Y'):
-                    offline_purchase = True
-                
-                processed_data.append({
-                    '작성자': nickname,
-                    '아이디': user_id,
-                    '회원랭킹': rank_info,
-                    '평점': converted_rating,
-                    '작성일': date,
-                    '구매옵션': option,
-                    '리뷰내용': content,
-                    '리뷰형태': review_type,
-                    '사진여부': '있음' if has_photo else '없음',
-                    '사진URL': ';'.join(photo_urls),
-                    '도움이 돼요 수': help_count,
-                    '재구매': '예' if repurchase else '아니오',
-                    '한달이상사용': '예' if long_use else '아니오',
-                    '오프라인구매': '예' if offline_purchase else '아니오',
-                    '피부정보': ', '.join(skin_info) if skin_info else ''
-                })
+                if sys.platform == 'win32':
+                    os.startfile(path)
+                elif sys.platform == 'darwin':  # macOS
+                    subprocess.Popen(['open', path])
+                else:  # Linux
+                    subprocess.Popen(['xdg-open', path])
             except Exception as e:
-                self.log(f"리뷰 처리 중 오류 발생: {e}")
-                continue
-        
-        # DataFrame 생성
-        df = pd.DataFrame(processed_data)
-        
-        # 데이터가 없는 경우 빈 DataFrame 반환
-        if df.empty:
-            self.log("처리할 리뷰 데이터가 없습니다.")
-            return df
-        
-        return df
+                self.message_box_signal.emit("critical", "오류", f"저장 폴더를 열 수 없습니다: {e}")
+                self.update_log_output(f"오류: 저장 폴더를 열 수 없습니다: {e}")
+        else:
+            self.message_box_signal.emit("warning", "경로 오류", "지정된 저장 경로가 존재하지 않습니다.")
+            self.update_log_output("오류: 지정된 저장 경로가 존재하지 않습니다.")
 
-def main():
-    root = tk.Tk()
-    app = OliveYoungReviewGUI(root)
-    root.mainloop()
+    def extract_product_id(self, input_string: str) -> str | None:
+        # URL 형식 확인
+        if input_string.startswith("http://") or input_string.startswith("https://"):
+            parsed_url = urlparse(input_string)
+            query_params = parse_qs(parsed_url.query)
+            goods_no = query_params.get('goodsNo', [None])[0]
+            if goods_no:
+                return goods_no
+            else:
+                # URL은 맞지만 goodsNo 파라미터가 없는 경우
+                self.update_log_output(f"경고: URL에서 'goodsNo' 파라미터를 찾을 수 없습니다: {input_string}")
+                return None
+        else:
+            # URL 형식이 아니면 상품 ID로 간주 (A로 시작하는 13자리 영숫자)
+            if re.fullmatch(r"A[0-9]{12}", input_string):
+                return input_string
+            else:
+                self.update_log_output(f"경고: 유효한 상품 ID 형식이 아닙니다: {input_string}")
+                return None
 
 if __name__ == "__main__":
-    main() 
+    app = QApplication(sys.argv)
+    app.setStyleSheet("QWidget { font-size: 10pt; }") # 모든 위젯의 기본 폰트 크기를 14pt로 설정
+    gui = OliveScraperGUI()
+    gui.show()
+    sys.exit(app.exec()) 
