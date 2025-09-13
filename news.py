@@ -6,6 +6,7 @@ import random
 import socket
 import sys
 import time
+import warnings
 from datetime import datetime
 
 import requests
@@ -15,6 +16,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 import undetected_chromedriver as uc # undetected_chromedriver 임포트 # type: ignore
+
+# SSL 경고 메시지 숨기기
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -45,9 +49,7 @@ def connect_driver(port: int, chrome_main_path: str, user_data_dir: str) -> uc.C
     
     driver = uc.Chrome(
         options=chrome_options,
-        use_subprocess=True,
-        browser_executable_path=chrome_main_path, # 크롬 실행 파일 경로 명시
-        user_data_dir=user_data_dir # 사용자 데이터 디렉토리 명시
+        use_subprocess=True
     )
     driver.implicitly_wait(1)
     return driver
@@ -307,11 +309,8 @@ def main():
         df = process_reviews(reviews)
         save_results(args.product_id, reviews, df, args.out_dir)
     finally:
-        # 연결만 끊고 창은 사용자 프로필 유지 목적상 닫지 않음
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        # 크롬 브라우저는 열어둔 채로 드라이버만 해제
+        pass
 
 
 if __name__ == '__main__':
