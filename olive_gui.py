@@ -4,19 +4,20 @@ import threading
 import logging
 import re
 from urllib.parse import urlparse, parse_qs
-from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QFileDialog, QFrame, QProgressBar, QMessageBox
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QFileDialog, QFrame, QProgressBar, QMessageBox, QScrollArea
 from PySide6.QtCore import Signal, QObject, Slot, Qt
 
-from olive_scraper import scrape_reviews
+from olive_scraper import ensure_chrome_debug, connect_driver, extract_session_from_driver, fetch_reviews, process_reviews, save_results, wait_for_page_load_and_handle_cloudflare
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# GUI 로깅을 위한 커스텀 핸들러
 class StreamHandler(logging.Handler, QObject):
     log_signal = Signal(str)
 
-    def __init__(self):
-        super().__init__()
-        QObject.__init__(self)
+    def __init__(self, parent=None):
+        QObject.__init__(self, parent)
+        logging.Handler.__init__(self)
 
     def emit(self, record):
         msg = self.format(record)
@@ -29,9 +30,11 @@ class OliveScraperGUI(QWidget):
 
     def __init__(self):
         super().__init__()
+        self.input_fields = [] # 동적 입력 필드를 저장할 리스트
         self.init_ui()
         self.init_logging()
         self.is_running = False
+        self.current_scraper_thread = None # 현재 실행 중인 스크래퍼 스레드
 
         self.status_update_signal.connect(self.status_label.setText)
         self.progress_update_signal.connect(self.progress_bar.setValue)
@@ -39,7 +42,7 @@ class OliveScraperGUI(QWidget):
 
     def init_ui(self):
         self.setWindowTitle("올리브영 리뷰 수집기")
-        self.setGeometry(100, 100, 800, 700)
+        self.setGeometry(100, 100, 800, 850) # 창 높이 증가
 
         main_layout = QVBoxLayout()
 
@@ -52,29 +55,30 @@ class OliveScraperGUI(QWidget):
         input_frame.setFrameShape(QFrame.StyledPanel)
         input_layout = QVBoxLayout()
         input_frame.setLayout(input_layout)
-        
-        self.product_id_input = self._create_input_field(input_layout, "상품 ID 또는 URL전체 복붙:")
-        self.product_id_input.setText("A000000213959")
-        
-        product_id_hint = QLabel("예: A000000159233 또는 상품페이지 URL")
-        # product_id_hint.setStyleSheet("font-size: 9pt;")
-        hint_hbox = QHBoxLayout()
-        hint_hbox.addStretch(1)
-        hint_hbox.addWidget(product_id_hint)
-        input_layout.addLayout(hint_hbox)
 
-        self.max_pages_input = self._create_input_field(input_layout, "최대 페이지 수(페이지 1당 리뷰 10개, Max 100):")
-        self.max_pages_input.setText("100")
-        
+        # 동적 입력 필드를 담을 스크롤 가능한 영역
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_content_widget = QWidget()
+        self.input_fields_layout = QVBoxLayout(scroll_content_widget)
+        scroll_area.setWidget(scroll_content_widget)
+        input_layout.addWidget(scroll_area)
+
+        # 기본 입력 필드 하나 추가
+        self._add_input_field_pair("A000000213959", 100)
+
+        add_link_button = QPushButton("링크 추가")
+        add_link_button.clicked.connect(lambda: self._add_input_field_pair())
+        input_layout.addWidget(add_link_button)
+
         output_format_label = QLabel("출력 형식: 엑셀(.xlsx)과 JSON 파일 모두 저장됩니다")
-        # output_format_label.setStyleSheet("font-size: 12pt;")
         format_hbox = QHBoxLayout()
         format_hbox.addStretch(1)
         format_hbox.addWidget(output_format_label)
         input_layout.addLayout(format_hbox)
 
         output_dir_hbox = QHBoxLayout()
-        output_dir_label = QLabel("추출데이터 저장 경로:")
+        output_dir_label = QLabel("저장할 폴더:")
         self.output_dir_input = QLineEdit(os.getcwd())
         output_dir_select_btn = QPushButton("찾아보기")
         output_dir_select_btn.clicked.connect(self._select_output_directory)
@@ -83,7 +87,6 @@ class OliveScraperGUI(QWidget):
         output_dir_hbox.addWidget(output_dir_select_btn)
         input_layout.addLayout(output_dir_hbox)
 
-        # Chrome 사용자 데이터 디렉토리 입력은 유지
         user_data_dir_hbox = QHBoxLayout()
         user_data_dir_label = QLabel("사용자프로필경로:")
         self.user_data_dir_input = QLineEdit(r"E:\brwProf\User Data")
@@ -147,24 +150,67 @@ class OliveScraperGUI(QWidget):
         self.setLayout(main_layout)
 
         self.log_output.append("올리브영 리뷰 수집기가 시작되었습니다.")
-        self.log_output.append("상품 ID 또는 URL을 입력하고 '리뷰 수집 시작' 버튼을 클릭하세요.")
+        self.log_output.append("상품 ID 또는 URL을 입력하고 '링크 추가' 버튼으로 여러 링크를 추가하여 수집할 수 있습니다.")
 
-    def _create_input_field(self, layout, label_text):
+    def _create_input_field(self, layout, label_text, default_value=""):
         hbox = QHBoxLayout()
         label = QLabel(label_text)
-        line_edit = QLineEdit()
+        line_edit = QLineEdit(default_value)
         hbox.addWidget(label)
         hbox.addWidget(line_edit)
-        layout.addLayout(hbox)
-        return line_edit
+        # layout.addLayout(hbox) # 직접 추가하지 않고, 외부에서 hbox를 사용하여 위젯 배치
+        return line_edit, hbox # hbox도 반환하여 나중에 레이아웃에서 제거할 수 있도록 함
+
+    def _add_input_field_pair(self, default_product_id="", default_max_pages=100):
+        pair_widget = QWidget()
+        pair_layout = QVBoxLayout(pair_widget) # QVBoxLayout로 변경
+
+        # 상품 ID/URL 입력 필드
+        product_id_input, product_id_hbox = self._create_input_field(None, "상품 ID/URL:", default_product_id)
+        pair_layout.addLayout(product_id_hbox)
+
+        # 최대 페이지 수 입력 필드 및 삭제 버튼
+        max_pages_input, max_pages_hbox = self._create_input_field(None, "최대 페이지 수(페이지 1당 리뷰 10개):")
+        max_pages_input.setText(str(default_max_pages))
+
+        delete_button = QPushButton("삭제")
+        delete_button.clicked.connect(lambda: self._remove_input_field_pair(pair_widget))
+        max_pages_hbox.addWidget(delete_button) # 삭제 버튼을 최대 페이지 수 입력 필드와 같은 줄에 추가
+        pair_layout.addLayout(max_pages_hbox)
+
+        self.input_fields_layout.addWidget(pair_widget)
+
+        # 구분선 추가
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        self.input_fields_layout.addWidget(separator)
+
+        self.input_fields.append({
+            'widget': pair_widget,
+            'separator': separator, # 구분선 위젯 추가
+            'product_id_input': product_id_input,
+            'max_pages_input': max_pages_input
+        })
+
+    def _remove_input_field_pair(self, widget_to_remove):
+        for i, field_data in enumerate(self.input_fields):
+            if field_data['widget'] == widget_to_remove:
+                # 위젯 제거
+                widget_to_remove.deleteLater()
+                # 구분선 제거
+                field_data['separator'].deleteLater()
+                # 리스트에서 제거
+                del self.input_fields[i]
+                break
 
     def _select_output_directory(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "출력 디렉토리 선택", self.output_dir_input.text())
+        dir_path = QFileDialog.getExistingDirectory(self, "추출데이터 저장 경로 선택", self.output_dir_input.text())
         if dir_path:
             self.output_dir_input.setText(dir_path)
 
     def _select_user_data_dir(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "Chrome 사용자 데이터 디렉토리 선택", self.user_data_dir_input.text())
+        dir_path = QFileDialog.getExistingDirectory(self, "사용자 프로필 경로 선택", self.user_data_dir_input.text())
         if dir_path:
             self.user_data_dir_input.setText(dir_path)
 
@@ -195,35 +241,37 @@ class OliveScraperGUI(QWidget):
         self.status_update_signal.emit("수집 준비 중...")
         self.progress_update_signal.emit(0)
 
-        input_value = self.product_id_input.text().strip()
-        if not input_value:
-            self.message_box_signal.emit("warning", "입력 오류", "상품 ID 또는 URL을 입력해주세요.")
-            self.update_log_output("오류: 상품 ID 또는 URL을 입력해주세요.")
-            self.status_update_signal.emit("오류 발생")
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            return
+        # 모든 입력 필드에서 상품 정보 가져오기
+        products_to_scrape = []
+        for field_data in self.input_fields:
+            input_value = field_data['product_id_input'].text().strip()
+            max_pages_str = field_data['max_pages_input'].text().strip()
 
-        product_id = self.extract_product_id(input_value)
-        if not product_id:
-            self.message_box_signal.emit("warning", "입력 오류", "유효한 상품 ID 또는 올리브영 URL을 입력해주세요.")
-            self.update_log_output("오류: 유효한 상품 ID 또는 올리브영 URL을 입력해주세요.")
-            self.status_update_signal.emit("오류 발생")
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            return
-        
-        max_pages_str = self.max_pages_input.text()
-        try:
-            max_pages = int(max_pages_str)
-            if max_pages <= 0:
-                raise ValueError("페이지 수는 1 이상이어야 합니다.")
-        except ValueError as e:
-            self.message_box_signal.emit("warning", "입력 오류", f"최대 페이지 수 입력이 잘못되었습니다. {e}")
-            self.update_log_output(f"오류: 최대 페이지 수 입력이 잘못되었습니다. {e}")
-            self.status_update_signal.emit("오류 발생")
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
+            if not input_value:
+                self.message_box_signal.emit("warning", "입력 오류", "상품 ID 또는 URL을 입력해주세요.")
+                self._reset_gui_state()
+                return
+
+            product_id = self.extract_product_id(input_value)
+            if not product_id:
+                self.message_box_signal.emit("warning", "입력 오류", f"유효한 상품 ID 또는 올리브영 URL이 아닙니다: {input_value}")
+                self._reset_gui_state()
+                return
+            
+            try:
+                max_pages = int(max_pages_str)
+                if max_pages <= 0:
+                    raise ValueError("페이지 수는 1 이상이어야 합니다.")
+            except ValueError as e:
+                self.message_box_signal.emit("warning", "입력 오류", f"최대 페이지 수 입력이 잘못되었습니다. {e}")
+                self.update_log_output(f"오류: 최대 페이지 수 입력이 잘못되었습니다. {e}")
+                self._reset_gui_state()
+                return
+            products_to_scrape.append({'product_id': product_id, 'max_pages': max_pages})
+
+        if not products_to_scrape:
+            self.message_box_signal.emit("warning", "입력 오류", "최소 하나 이상의 상품을 추가해주세요.")
+            self._reset_gui_state()
             return
 
         out_dir = self.output_dir_input.text()
@@ -233,57 +281,107 @@ class OliveScraperGUI(QWidget):
             except OSError as e:
                 self.message_box_signal.emit("critical", "오류", f"출력 디렉토리를 생성할 수 없습니다: {e}")
                 self.update_log_output(f"오류: 출력 디렉토리를 생성할 수 없습니다: {e}")
-                self.status_update_signal.emit("오류 발생")
-                self.start_button.setEnabled(True)
-                self.stop_button.setEnabled(False)
+                self._reset_gui_state()
                 return
         
         user_data_dir = self.user_data_dir_input.text()
         chrome_main_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe" # 고정된 값
-        port = "9222" # 고정된 값
+        port = 9222 # 고정된 값
 
         self.is_running = True
-        threading.Thread(target=self._run_scraper_thread, args=(
-            product_id, max_pages, out_dir, user_data_dir, chrome_main_path, port
-        )).start()
+        self.current_scraper_thread = threading.Thread(target=self._run_scraper_thread, args=(
+            products_to_scrape, out_dir, user_data_dir, chrome_main_path, port
+        ))
+        self.current_scraper_thread.start()
 
-    def _run_scraper_thread(self, product_id, max_pages, out_dir, user_data_dir, chrome_main_path, port):
+    def _run_scraper_thread(self, products_to_scrape, out_dir, user_data_dir, chrome_main_path, port):
+        driver = None
         try:
-            scrape_reviews(
-                product_id=product_id,
-                max_pages=max_pages,
-                out_dir=out_dir,
-                port=int(port), # port를 int로 변환하여 전달
-                user_data_dir=user_data_dir,
-                chrome_main_path=chrome_main_path,
-                log_callback=self.update_log_output,
-                stop_check_callback=lambda: not self.is_running
-            )
-            if self.is_running:
-                self.update_log_output("리뷰 수집이 완료되었습니다.")
+            # 드라이버는 한 번만 연결
+            self.status_update_signal.emit("Chrome 드라이버 연결 중...")
+            ensure_chrome_debug(port, user_data_dir) # 브라우저 실행 확인
+            driver = connect_driver(port, chrome_main_path=chrome_main_path, user_data_dir=user_data_dir)
+            self.update_log_output("Chrome 드라이버 연결 완료.")
+
+            for i, product_data in enumerate(products_to_scrape):
+                if not self.is_running:
+                    self.update_log_output(f"전체 수집이 중지되었습니다.")
+                    break
+
+                product_id = product_data['product_id']
+                max_pages = product_data['max_pages']
+                self.update_log_output(f"\n--- 상품 {i+1}/{len(products_to_scrape)} 수집 시작: 상품 ID={product_id}, 최대 페이지={max_pages} ---")
+                self.status_update_signal.emit(f"상품 {i+1}/{len(products_to_scrape)} ({product_id}) 수집 중...")
+                self.progress_update_signal.emit(0)
+
+                # 페이지 로드 및 Cloudflare 처리 (driver 객체 재사용)
+                if not wait_for_page_load_and_handle_cloudflare(driver, product_id, timeout=60, log_callback=self.update_log_output, stop_check_callback=lambda: not self.is_running):
+                    self.update_log_output("Cloudflare 또는 페이지 로드 문제로 인증 정보 획득 실패. 다음 상품으로 넘어갑니다.")
+                    continue # 다음 상품으로 이동
+                
+                if not self.is_running:
+                    self.update_log_output(f"사용자에 의해 수집이 중지되었습니다. 다음 상품으로 넘어갑니다.")
+                    continue # 다음 상품으로 이동
+
+                session, user_agent = extract_session_from_driver(driver)
+                reviews = fetch_reviews(session, user_agent, product_id, max_pages, log_callback=self.update_log_output, stop_check_callback=lambda: not self.is_running)
+                
+                if not self.is_running:
+                    self.update_log_output(f"사용자에 의해 수집이 중지되었습니다. 결과 저장을 건너뜁니다.")
+                    continue # 다음 상품으로 이동
+
+                if not reviews:
+                    self.update_log_output(f"상품 ID {product_id}에 대해 수집된 리뷰가 없습니다.")
+                    continue # 다음 상품으로 이동
+                
+                df = process_reviews(reviews)
+                save_results(product_id, reviews, df, out_dir, log_callback=self.update_log_output)
+                self.update_log_output(f"--- 상품 {i+1}/{len(products_to_scrape)} 수집 완료: 상품 ID={product_id} ---")
+
+            if self.is_running: # 모든 상품 수집이 정상적으로 완료되었을 때만 최종 메시지
+                self.update_log_output("모든 리뷰 수집이 완료되었습니다.")
                 self.status_update_signal.emit("완료")
                 self.progress_update_signal.emit(100)
-                self.message_box_signal.emit("information", "수집 완료", "리뷰 수집이 완료되었습니다.")
+                self.message_box_signal.emit("information", "수집 완료", "모든 리뷰 수집이 완료되었습니다.")
+            else:
+                self.update_log_output("사용자에 의해 모든 수집이 중지되었습니다.")
+
         except Exception as e:
-            self.update_log_output(f"오류 발생: {e}")
+            self.update_log_output(f"스크래핑 중 오류 발생: {e}")
             self.status_update_signal.emit("오류 발생")
             self.message_box_signal.emit("critical", "오류", f"리뷰 수집 중 오류가 발생했습니다:\n{e}")
         finally:
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            self.is_running = False
+            if driver:
+                try:
+                    driver.quit() # 모든 작업 완료 후 드라이버 명시적 종료
+                    self.update_log_output("Chrome 드라이버를 종료했습니다.")
+                except Exception as e:
+                    self.update_log_output(f"Chrome 드라이버 종료 중 오류 발생: {e}")
+                    logging.error(f"Chrome 드라이버 종료 중 오류 발생: {e}", exc_info=True)
+            self._reset_gui_state() # GUI 상태 초기화
 
     def stop_collection(self):
         self.is_running = False
-        self.update_log_output("리뷰 수집이 중지되었습니다.")
-        self.status_update_signal.emit("중지됨")
+        if self.current_scraper_thread and self.current_scraper_thread.is_alive():
+            self.update_log_output("현재 진행 중인 스크래핑 작업을 중지 요청했습니다. 잠시 기다려주세요...")
+            # 스레드는 is_running 플래그를 확인하여 스스로 종료될 것임
+        else:
+            self.update_log_output("리뷰 수집이 중지되었습니다.")
+            self._reset_gui_state()
+
+    def _reset_gui_state(self):
+        # 메인 스레드에서 GUI 상태를 안전하게 초기화
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self.is_running = False
+        self.status_update_signal.emit("준비 완료")
+        self.progress_update_signal.emit(0)
 
     def open_save_folder(self):
         path = self.output_dir_input.text()
         if os.path.exists(path):
             try:
+                import subprocess # subprocess 임포트
                 if sys.platform == 'win32':
                     os.startfile(path)
                 elif sys.platform == 'darwin':  # macOS
@@ -306,11 +404,9 @@ class OliveScraperGUI(QWidget):
             if goods_no:
                 return goods_no
             else:
-                # URL은 맞지만 goodsNo 파라미터가 없는 경우
                 self.update_log_output(f"경고: URL에서 'goodsNo' 파라미터를 찾을 수 없습니다: {input_string}")
                 return None
         else:
-            # URL 형식이 아니면 상품 ID로 간주 (A로 시작하는 13자리 영숫자)
             if re.fullmatch(r"A[0-9]{12}", input_string):
                 return input_string
             else:
@@ -319,7 +415,7 @@ class OliveScraperGUI(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyleSheet("QWidget { font-size: 10pt; }") # 모든 위젯의 기본 폰트 크기를 14pt로 설정
+    app.setStyleSheet("QWidget { font-size: 12pt; }")
     gui = OliveScraperGUI()
     gui.show()
     sys.exit(app.exec()) 
