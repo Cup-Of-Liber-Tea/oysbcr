@@ -6,11 +6,40 @@ import re
 from urllib.parse import urlparse, parse_qs
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QFileDialog, QFrame, QProgressBar, QMessageBox, QScrollArea
 from PySide6.QtCore import Signal, QObject, Slot, Qt
-import configparser # configparser 모듈 임포트
+import configparser
+from datetime import datetime
 
 from olive_scraper import ensure_chrome_debug, connect_driver, extract_session_from_driver, fetch_reviews, process_reviews, save_results, wait_for_page_load_and_handle_cloudflare
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# 로그 파일 설정
+LOG_DIR = "logs"
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
+LOG_FILENAME = os.path.join(LOG_DIR, datetime.now().strftime("%Y%m%d_%H%M%S.log"))
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[
+                        logging.FileHandler(LOG_FILENAME, encoding='utf-8'),
+                        logging.StreamHandler(sys.stdout) # 콘솔에도 출력
+                    ])
+
+# 전역 예외 핸들러
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        # CTRL+C 인터럽트는 기본 핸들러로 전달
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    logging.critical("처리되지 않은 예외 발생!", exc_info=(exc_type, exc_value, exc_traceback))
+    # GUI에 메시지 박스 표시 (QApplication 인스턴스가 생성된 후에만 가능)
+    if QApplication.instance():
+        error_message = f"예기치 않은 오류가 발생하여 프로그램이 종료됩니다.\n자세한 내용은 로그 파일({LOG_FILENAME})을 참조하세요.\n오류: {exc_value}"
+        QMessageBox.critical(QApplication.instance().activeWindow(), "치명적 오류", error_message)
+    else:
+        print(f"치명적 오류: {exc_value}")
+        print(f"로그 파일: {LOG_FILENAME}")
+
+sys.excepthook = handle_exception
 
 # GUI 로깅을 위한 커스텀 핸들러
 class StreamHandler(logging.Handler, QObject):
@@ -44,6 +73,8 @@ class OliveScraperGUI(QWidget):
         self.progress_update_signal.connect(self.progress_bar.setValue)
         self.message_box_signal.connect(self._show_message_box)
 
+        logging.info("올리브영 리뷰 수집기 GUI 시작.")
+
     def load_settings(self):
         self.config.read(self.settings_file)
         if 'Settings' not in self.config:
@@ -54,7 +85,7 @@ class OliveScraperGUI(QWidget):
     def save_settings(self):
         self.config['Settings']['output_directory'] = self.output_dir_input.text()
         self.config['Settings']['user_data_directory'] = self.user_data_dir_input.text()
-        with open(self.settings_file, 'w') as configfile:
+        with open(self.settings_file, 'w', encoding='utf-8') as configfile:
             self.config.write(configfile)
 
     def init_ui(self):
@@ -132,6 +163,7 @@ class OliveScraperGUI(QWidget):
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
+        self.progress_bar.setTextVisible(True) # 진행률 텍스트 보이게 설정
         progress_layout.addWidget(self.progress_bar)
 
         self.status_label = QLabel("준비 완료")
@@ -187,7 +219,7 @@ class OliveScraperGUI(QWidget):
         pair_layout.addLayout(product_id_hbox)
 
         # 최대 페이지 수 입력 필드 및 삭제 버튼
-        max_pages_input, max_pages_hbox = self._create_input_field(None, "최대 페이지 수(페이지 1당 리뷰 10개, Max 100):")
+        max_pages_input, max_pages_hbox = self._create_input_field(None, "최대 페이지 수(페이지 1당 리뷰 10개):")
         max_pages_input.setText(str(default_max_pages))
 
         delete_button = QPushButton("삭제")
@@ -234,9 +266,10 @@ class OliveScraperGUI(QWidget):
             self.save_settings() # 설정 저장
 
     def init_logging(self):
-        self.log_handler = StreamHandler()
-        self.log_handler.log_signal.connect(self.update_log_output)
-        logging.getLogger().addHandler(self.log_handler)
+        # StreamHandler는 이미 basicConfig에서 stdout으로 추가되었으므로 여기서는 GUI 텍스트 에디터 연결만.
+        self.gui_log_handler = StreamHandler()
+        self.gui_log_handler.log_signal.connect(self.update_log_output)
+        logging.getLogger().addHandler(self.gui_log_handler)
 
     @Slot(str)
     def update_log_output(self, msg):
@@ -257,6 +290,7 @@ class OliveScraperGUI(QWidget):
         self.stop_button.setEnabled(True)
         self.log_output.clear()
         self.log_output.append("리뷰 수집을 시작합니다...")
+        logging.info("리뷰 수집을 시작합니다...") # 파일에도 로그 기록
         self.status_update_signal.emit("수집 준비 중...")
         self.progress_update_signal.emit(0)
 
@@ -268,12 +302,14 @@ class OliveScraperGUI(QWidget):
 
             if not input_value:
                 self.message_box_signal.emit("warning", "입력 오류", "상품 ID 또는 URL을 입력해주세요.")
+                logging.warning("상품 ID 또는 URL이 입력되지 않았습니다.")
                 self._reset_gui_state()
                 return
 
             product_id = self.extract_product_id(input_value)
             if not product_id:
                 self.message_box_signal.emit("warning", "입력 오류", f"유효한 상품 ID 또는 올리브영 URL이 아닙니다: {input_value}")
+                logging.warning(f"유효하지 않은 상품 ID 또는 URL: {input_value}")
                 self._reset_gui_state()
                 return
             
@@ -283,13 +319,14 @@ class OliveScraperGUI(QWidget):
                     raise ValueError("페이지 수는 1 이상이어야 합니다.")
             except ValueError as e:
                 self.message_box_signal.emit("warning", "입력 오류", f"최대 페이지 수 입력이 잘못되었습니다. {e}")
-                self.update_log_output(f"오류: 최대 페이지 수 입력이 잘못되었습니다. {e}")
+                logging.error(f"최대 페이지 수 입력 오류: {e}")
                 self._reset_gui_state()
                 return
             products_to_scrape.append({'product_id': product_id, 'max_pages': max_pages})
 
         if not products_to_scrape:
             self.message_box_signal.emit("warning", "입력 오류", "최소 하나 이상의 상품을 추가해주세요.")
+            logging.warning("수집할 상품이 없습니다.")
             self._reset_gui_state()
             return
 
@@ -297,9 +334,10 @@ class OliveScraperGUI(QWidget):
         if not os.path.exists(out_dir):
             try:
                 os.makedirs(out_dir)
+                logging.info(f"출력 디렉토리 생성: {out_dir}")
             except OSError as e:
                 self.message_box_signal.emit("critical", "오류", f"출력 디렉토리를 생성할 수 없습니다: {e}")
-                self.update_log_output(f"오류: 출력 디렉토리를 생성할 수 없습니다: {e}")
+                logging.critical(f"출력 디렉토리 생성 실패: {e}")
                 self._reset_gui_state()
                 return
         
@@ -307,6 +345,7 @@ class OliveScraperGUI(QWidget):
         chrome_main_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe" # 고정된 값
         port = 9222 # 고정된 값
 
+        logging.info(f"스크래핑 시작: 상품 정보={products_to_scrape}, 출력 디렉토리={out_dir}, 사용자 데이터 디렉토리={user_data_dir}, 포트={port}")
         self.is_running = True
         self.current_scraper_thread = threading.Thread(target=self._run_scraper_thread, args=(
             products_to_scrape, out_dir, user_data_dir, chrome_main_path, port
@@ -316,30 +355,34 @@ class OliveScraperGUI(QWidget):
     def _run_scraper_thread(self, products_to_scrape, out_dir, user_data_dir, chrome_main_path, port):
         driver = None
         try:
-            # 드라이버는 한 번만 연결
             self.status_update_signal.emit("Chrome 드라이버 연결 중...")
-            ensure_chrome_debug(port, user_data_dir) # 브라우저 실행 확인
+            logging.info("Chrome 드라이버 연결 중...")
             driver = connect_driver(port, chrome_main_path=chrome_main_path, user_data_dir=user_data_dir)
             self.update_log_output("Chrome 드라이버 연결 완료.")
+            logging.info("Chrome 드라이버 연결 완료.")
 
             for i, product_data in enumerate(products_to_scrape):
                 if not self.is_running:
                     self.update_log_output(f"전체 수집이 중지되었습니다.")
+                    logging.info("사용자에 의해 전체 수집이 중지되었습니다.")
                     break
 
                 product_id = product_data['product_id']
                 max_pages = product_data['max_pages']
                 self.update_log_output(f"\n--- 상품 {i+1}/{len(products_to_scrape)} 수집 시작: 상품 ID={product_id}, 최대 페이지={max_pages} ---")
+                logging.info(f"--- 상품 {i+1}/{len(products_to_scrape)} 수집 시작: 상품 ID={product_id}, 최대 페이지={max_pages} ---")
                 self.status_update_signal.emit(f"상품 {i+1}/{len(products_to_scrape)} ({product_id}) 수집 중...")
                 self.progress_update_signal.emit(0)
 
                 # 페이지 로드 및 Cloudflare 처리 (driver 객체 재사용)
                 if not wait_for_page_load_and_handle_cloudflare(driver, product_id, timeout=60, log_callback=self.update_log_output, stop_check_callback=lambda: not self.is_running):
                     self.update_log_output("Cloudflare 또는 페이지 로드 문제로 인증 정보 획득 실패. 다음 상품으로 넘어갑니다.")
+                    logging.warning(f"상품 {product_id}: Cloudflare 또는 페이지 로드 문제로 인증 정보 획득 실패. 다음 상품으로 넘어갑니다.")
                     continue # 다음 상품으로 이동
                 
                 if not self.is_running:
                     self.update_log_output(f"사용자에 의해 수집이 중지되었습니다. 다음 상품으로 넘어갑니다.")
+                    logging.info(f"상품 {product_id}: 사용자에 의해 수집이 중지되었습니다.")
                     continue # 다음 상품으로 이동
 
                 session, user_agent = extract_session_from_driver(driver)
@@ -347,26 +390,32 @@ class OliveScraperGUI(QWidget):
                 
                 if not self.is_running:
                     self.update_log_output(f"사용자에 의해 수집이 중지되었습니다. 결과 저장을 건너뜁니다.")
+                    logging.info(f"상품 {product_id}: 사용자에 의해 수집이 중지되었습니다. 결과 저장을 건너뜀.")
                     continue # 다음 상품으로 이동
 
                 if not reviews:
                     self.update_log_output(f"상품 ID {product_id}에 대해 수집된 리뷰가 없습니다.")
+                    logging.warning(f"상품 ID {product_id}에 대해 수집된 리뷰가 없습니다.")
                     continue # 다음 상품으로 이동
                 
                 df = process_reviews(reviews)
                 save_results(product_id, reviews, df, out_dir, log_callback=self.update_log_output)
                 self.update_log_output(f"--- 상품 {i+1}/{len(products_to_scrape)} 수집 완료: 상품 ID={product_id} ---")
+                logging.info(f"--- 상품 {i+1}/{len(products_to_scrape)} 수집 완료: 상품 ID={product_id} ---")
 
             if self.is_running: # 모든 상품 수집이 정상적으로 완료되었을 때만 최종 메시지
                 self.update_log_output("모든 리뷰 수집이 완료되었습니다.")
+                logging.info("모든 리뷰 수집이 완료되었습니다.")
                 self.status_update_signal.emit("완료")
                 self.progress_update_signal.emit(100)
                 self.message_box_signal.emit("information", "수집 완료", "모든 리뷰 수집이 완료되었습니다.")
             else:
                 self.update_log_output("사용자에 의해 모든 수집이 중지되었습니다.")
+                logging.info("사용자에 의해 모든 수집이 중지되었습니다.")
 
         except Exception as e:
             self.update_log_output(f"스크래핑 중 오류 발생: {e}")
+            logging.exception("스크래핑 중 오류 발생:") # 예외 정보 포함하여 로그 기록
             self.status_update_signal.emit("오류 발생")
             self.message_box_signal.emit("critical", "오류", f"리뷰 수집 중 오류가 발생했습니다:\n{e}")
         finally:
@@ -374,6 +423,7 @@ class OliveScraperGUI(QWidget):
                 try:
                     driver.quit() # 모든 작업 완료 후 드라이버 명시적 종료
                     self.update_log_output("Chrome 드라이버를 종료했습니다.")
+                    logging.info("Chrome 드라이버를 종료했습니다.")
                 except Exception as e:
                     self.update_log_output(f"Chrome 드라이버 종료 중 오류 발생: {e}")
                     logging.error(f"Chrome 드라이버 종료 중 오류 발생: {e}", exc_info=True)
@@ -383,9 +433,11 @@ class OliveScraperGUI(QWidget):
         self.is_running = False
         if self.current_scraper_thread and self.current_scraper_thread.is_alive():
             self.update_log_output("현재 진행 중인 스크래핑 작업을 중지 요청했습니다. 잠시 기다려주세요...")
+            logging.info("스크래핑 중지 요청됨.")
             # 스레드는 is_running 플래그를 확인하여 스스로 종료될 것임
         else:
             self.update_log_output("리뷰 수집이 중지되었습니다.")
+            logging.info("리뷰 수집이 중지되었습니다.")
             self._reset_gui_state()
 
     def _reset_gui_state(self):
@@ -395,6 +447,7 @@ class OliveScraperGUI(QWidget):
         self.is_running = False
         self.status_update_signal.emit("준비 완료")
         self.progress_update_signal.emit(0)
+        logging.info("GUI 상태 초기화됨.")
 
     def open_save_folder(self):
         path = self.output_dir_input.text()
@@ -407,12 +460,13 @@ class OliveScraperGUI(QWidget):
                     subprocess.Popen(['open', path])
                 else:  # Linux
                     subprocess.Popen(['xdg-open', path])
+                logging.info(f"저장 폴더 열기: {path}")
             except Exception as e:
                 self.message_box_signal.emit("critical", "오류", f"저장 폴더를 열 수 없습니다: {e}")
-                self.update_log_output(f"오류: 저장 폴더를 열 수 없습니다: {e}")
+                logging.error(f"저장 폴더 열기 실패: {e}", exc_info=True)
         else:
             self.message_box_signal.emit("warning", "경로 오류", "지정된 저장 경로가 존재하지 않습니다.")
-            self.update_log_output("오류: 지정된 저장 경로가 존재하지 않습니다.")
+            logging.warning("지정된 저장 경로가 존재하지 않습니다.")
 
     def extract_product_id(self, input_string: str) -> str | None:
         # URL 형식 확인
@@ -423,18 +477,18 @@ class OliveScraperGUI(QWidget):
             if goods_no:
                 return goods_no
             else:
-                self.update_log_output(f"경고: URL에서 'goodsNo' 파라미터를 찾을 수 없습니다: {input_string}")
+                logging.warning(f"URL에서 'goodsNo' 파라미터를 찾을 수 없습니다: {input_string}")
                 return None
         else:
             if re.fullmatch(r"A[0-9]{12}", input_string):
                 return input_string
             else:
-                self.update_log_output(f"경고: 유효한 상품 ID 형식이 아닙니다: {input_string}")
+                logging.warning(f"유효한 상품 ID 형식이 아닙니다: {input_string}")
                 return None
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyleSheet("QWidget { font-size: 14pt; }") # 폰트 사이즈 14pt로 변경
+    app.setStyleSheet("QWidget { font-size: 14pt; }")
     gui = OliveScraperGUI()
     gui.show()
     sys.exit(app.exec()) 

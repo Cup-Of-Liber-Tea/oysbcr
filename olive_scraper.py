@@ -44,11 +44,12 @@ def ensure_chrome_debug(port: int, user_data_dir: str) -> None:
 
 def connect_driver(port: int, chrome_main_path: str, user_data_dir: str) -> uc.Chrome:
     chrome_options = Options()
-    chrome_options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
+    if user_data_dir:
+        chrome_options.add_argument(f'--user-data-dir={user_data_dir}')
     
     driver = uc.Chrome(
         options=chrome_options,
-        use_subprocess=True
+        version_main=140
     )
     driver.implicitly_wait(1)
     return driver
@@ -297,10 +298,6 @@ def save_results(product_id: str, reviews: list, df, out_dir: str, log_callback=
             log_callback("가공 데이터프레임이 비어 있어 엑셀/가공JSON 저장 생략")
 
 def scrape_reviews(product_id: str, max_pages: int, out_dir: str, port: int, user_data_dir: str, chrome_main_path: str, log_callback=None, stop_check_callback=None):
-    # if log_callback:
-    #     log_callback(f"스크래핑 시작: 상품 ID={product_id}, 최대 페이지={max_pages}, 출력 디렉토리={out_dir}, 포트={port}, 사용자 데이터 디렉토리={user_data_dir}")
-    
-    ensure_chrome_debug(port, user_data_dir)
     driver = None
     try:
         driver = connect_driver(port, chrome_main_path=chrome_main_path, user_data_dir=user_data_dir)
