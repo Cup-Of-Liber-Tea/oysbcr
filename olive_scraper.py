@@ -28,28 +28,28 @@ def is_port_in_use(port: int) -> bool:
         return s.connect_ex(('localhost', port)) == 0
 
 
-def ensure_chrome_debug(port: int, user_data_dir: str) -> None:
+def ensure_chrome_debug(port: int, user_data_dir: str):
     if not is_port_in_use(port):
-        # logging.info(f"포트 {port}에서 실행 중인 크롬 브라우저가 없습니다. 새로 실행합니다.")
         chrome_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
         if not os.path.exists(chrome_path):
             raise FileNotFoundError(f"Chrome 실행 파일을 찾을 수 없습니다: {chrome_path}")
         cmd = f'"{chrome_path}" --remote-debugging-port={port} --user-data-dir="{user_data_dir}"'
         import subprocess
-        subprocess.Popen(cmd)
-        time.sleep(4)  # 브라우저 시작 대기
+        process = subprocess.Popen(cmd, shell=True)
+        time.sleep(4)
+        return process
     else:
         logging.info(f"포트 {port}에서 이미 실행 중인 크롬 브라우저를 사용합니다.")
+        return None
 
 
 def connect_driver(port: int, chrome_main_path: str, user_data_dir: str) -> uc.Chrome:
     chrome_options = Options()
-    if user_data_dir:
-        chrome_options.add_argument(f'--user-data-dir={user_data_dir}')
+    chrome_options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
     
     driver = uc.Chrome(
         options=chrome_options,
-        version_main=140
+        use_subprocess=True
     )
     driver.implicitly_wait(1)
     return driver
@@ -57,37 +57,34 @@ def connect_driver(port: int, chrome_main_path: str, user_data_dir: str) -> uc.C
 
 def wait_for_page_load_and_handle_cloudflare(driver: uc.Chrome, product_id: str, timeout: int = 60, log_callback=None, stop_check_callback=None) -> bool:
     """상품 페이지로 이동하고, Cloudflare 인증에 걸리면 사용자에게 해결을 요청합니다."""
-    product_url = f"https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo={product_id}"
-    driver.get(product_url)
-    if log_callback:
-        log_callback(f"상품 페이지 로드 시도: {product_url}")
-
     try:
+        product_url = f"https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo={product_id}"
+        driver.get(product_url)
+        if log_callback:
+            log_callback(f"상품 페이지 로드 시도: {product_url}")
+
         WebDriverWait(driver, timeout).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "#gdasContents, .prd_detail_box"))
         )
         if log_callback:
             log_callback("페이지 콘텐츠 로드 완료. 인간적인 행동 시뮬레이션 중...")
-        # 페이지가 로드된 후 인간적인 행동 시뮬레이션
-        for _ in range(random.randint(1, 3)): # 1~3회 무작위 스크롤
+        
+        for _ in range(random.randint(1, 3)):
             driver.execute_script(f"window.scrollBy(0, {random.randint(200, 800)});")
-            time.sleep(random.uniform(0.5, 1.5)) # 0.5~1.5초 무작위 대기
-        driver.execute_script("window.scrollTo(0, 0);") # 다시 맨 위로 스크롤
-        time.sleep(random.uniform(1, 2)) # 마지막 대기
+            time.sleep(random.uniform(0.5, 1.5))
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(random.uniform(1, 2))
 
         return True
     except Exception as e:
         if log_callback:
-            log_callback(f"페이지 콘텐츠 로드 실패. Cloudflare 또는 다른 인증 문제가 발생했을 수 있습니다. 오류: {e}")
+            log_callback(f"페이지 로드 실패: {e}")
+            try:
+                log_callback(f"현재 URL: {driver.current_url}")
+            except Exception as url_error:
+                logging.debug(f"URL 가져오기 실패: {url_error}")
             log_callback("브라우저 창을 확인하여 캡차를 수동으로 해결하거나, 로그인을 시도해주세요.")
-            log_callback(f"현재 URL: {driver.current_url}")
-        
-        # GUI 메시지 박스를 통해 사용자에게 해결 요청
-        if log_callback:
-            log_callback("Cloudflare 인증 또는 로그인 후 다시 시도해주세요.")
-        
-        if stop_check_callback:
-            stop_check_callback() # 수집 중지 요청
+        logging.error(f"페이지 로드 실패: {e}", exc_info=True)
         return False
 
 
@@ -103,12 +100,21 @@ def fetch_reviews(session: requests.Session, user_agent: str, product_id: str, t
     all_reviews: list = []
     progress_interval = max(1, total_pages // 20)
     start_time = time.time()
+    
+    if log_callback:
+        log_callback(f"fetch_reviews 시작: 총 {total_pages}페이지 수집 예정")
+    logging.info(f"fetch_reviews 시작: product_id={product_id}, total_pages={total_pages}")
 
     for page in range(1, total_pages + 1):
         if stop_check_callback and stop_check_callback():
             if log_callback:
                 log_callback("수집 중지 요청 감지. 리뷰 수집을 중단합니다.")
             break
+        
+        if log_callback and page == 1:
+            log_callback(f"첫 번째 페이지 요청 준비 중...")
+        logging.debug(f"페이지 {page} 요청 준비 중...")
+        
         headers = {
             'User-Agent': user_agent,
             'Referer': f'https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo={product_id}',
@@ -143,22 +149,40 @@ def fetch_reviews(session: requests.Session, user_agent: str, product_id: str, t
         max_retries = 3
         retry = 0
         response = None
+        
+        if log_callback and page == 1:
+            log_callback(f"API 요청 시작: {url}")
+        logging.debug(f"페이지 {page} API 요청: {url}")
+        
         while retry < max_retries:
             if stop_check_callback and stop_check_callback():
                 if log_callback:
                     log_callback("수집 중지 요청 감지. 리뷰 수집을 중단합니다.")
-                return [] # 즉시 중단
+                return all_reviews
             try:
+                if log_callback and page == 1 and retry == 0:
+                    log_callback(f"첫 요청 전송 중... (timeout=20초)")
+                logging.debug(f"페이지 {page} 요청 시도 {retry+1}/{max_retries}")
+                
                 response = session.get(url, params=params, headers=headers, timeout=20, verify=False)
+                
+                if log_callback and page == 1 and retry == 0:
+                    log_callback(f"응답 받음: 상태 코드 {response.status_code}")
+                logging.debug(f"페이지 {page} 응답: {response.status_code}")
+                
                 if response.status_code == 200:
                     break
                 retry += 1
-                time.sleep(random.uniform(3, 6))
+                if retry < max_retries:
+                    time.sleep(random.uniform(3, 6))
             except Exception as e:
-                if log_callback:
-                    log_callback(f"페이지 {page} 요청 오류, 재시도 {retry+1}/{max_retries}: {e}")
                 retry += 1
-                time.sleep(random.uniform(8, 12))
+                error_msg = f"페이지 {page} 요청 오류 (재시도 {retry}/{max_retries}): {type(e).__name__}: {e}"
+                if log_callback:
+                    log_callback(error_msg)
+                logging.error(error_msg, exc_info=True)
+                if retry < max_retries:
+                    time.sleep(random.uniform(8, 12))
                 continue
 
         time.sleep(random.uniform(1.2, 2.0))
@@ -308,11 +332,15 @@ def scrape_reviews(product_id: str, max_pages: int, out_dir: str, port: int, use
             return
 
         session, user_agent = extract_session_from_driver(driver)
-        reviews = fetch_reviews(session, user_agent, product_id, max_pages, log_callback, stop_check_callback)
+        try:
+            reviews = fetch_reviews(session, user_agent, product_id, max_pages, log_callback, stop_check_callback)
+        finally:
+            session.close()
+            
         if stop_check_callback and stop_check_callback():
             if log_callback:
                 log_callback("사용자에 의해 수집이 중지되었습니다. 결과 저장을 건너뜁니다.")
-            return # 중지 요청이 있었으므로 결과 저장을 건너옴
+            return
         
         if not reviews:
             if log_callback:
@@ -327,10 +355,12 @@ def scrape_reviews(product_id: str, max_pages: int, out_dir: str, port: int, use
     finally:
         if driver:
             try:
-                driver.quit() # 드라이버 명시적 종료
+                driver.quit()
                 if log_callback:
                     log_callback("Chrome 드라이버를 종료했습니다.")
-            except Exception as e:
+            except (OSError, Exception) as e:
                 if log_callback:
                     log_callback(f"Chrome 드라이버 종료 중 오류 발생: {e}")
-                logging.error(f"Chrome 드라이버 종료 중 오류 발생: {e}", exc_info=True)
+                logging.warning(f"Chrome 드라이버 종료 중 오류 발생: {e}")
+            finally:
+                driver = None

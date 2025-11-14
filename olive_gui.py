@@ -11,16 +11,9 @@ from datetime import datetime
 
 from olive_scraper import ensure_chrome_debug, connect_driver, extract_session_from_driver, fetch_reviews, process_reviews, save_results, wait_for_page_load_and_handle_cloudflare
 
-# 로그 파일 설정
-LOG_DIR = "logs"
-if not os.path.exists(LOG_DIR):
-    os.makedirs(LOG_DIR)
-LOG_FILENAME = os.path.join(LOG_DIR, datetime.now().strftime("%Y%m%d_%H%M%S.log"))
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
                     handlers=[
-                        logging.FileHandler(LOG_FILENAME, encoding='utf-8'),
-                        logging.StreamHandler(sys.stdout) # 콘솔에도 출력
+                        logging.StreamHandler(sys.stdout)
                     ])
 
 # 전역 예외 핸들러
@@ -31,13 +24,11 @@ def handle_exception(exc_type, exc_value, exc_traceback):
         return
 
     logging.critical("처리되지 않은 예외 발생!", exc_info=(exc_type, exc_value, exc_traceback))
-    # GUI에 메시지 박스 표시 (QApplication 인스턴스가 생성된 후에만 가능)
     if QApplication.instance():
-        error_message = f"예기치 않은 오류가 발생하여 프로그램이 종료됩니다.\n자세한 내용은 로그 파일({LOG_FILENAME})을 참조하세요.\n오류: {exc_value}"
+        error_message = f"예기치 않은 오류가 발생하여 프로그램이 종료됩니다.\n오류: {exc_value}"
         QMessageBox.critical(QApplication.instance().activeWindow(), "치명적 오류", error_message)
     else:
         print(f"치명적 오류: {exc_value}")
-        print(f"로그 파일: {LOG_FILENAME}")
 
 sys.excepthook = handle_exception
 
@@ -60,14 +51,15 @@ class OliveScraperGUI(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.input_fields = [] # 동적 입력 필드를 저장할 리스트
-        self.config = configparser.ConfigParser() # configparser 초기화
-        self.settings_file = 'config.ini' # 설정 파일 이름
-        self.load_settings() # 설정 로드
+        self.input_fields = []
+        self.config = configparser.ConfigParser()
+        self.settings_file = 'config.ini'
+        self.load_settings()
         self.init_ui()
         self.init_logging()
         self.is_running = False
-        self.current_scraper_thread = None # 현재 실행 중인 스크래퍼 스레드
+        self.is_running_lock = threading.Lock()
+        self.current_scraper_thread = None
 
         self.status_update_signal.connect(self.status_label.setText)
         self.progress_update_signal.connect(self.progress_bar.setValue)
@@ -346,7 +338,7 @@ class OliveScraperGUI(QWidget):
         port = 9222 # 고정된 값
 
         logging.info(f"스크래핑 시작: 상품 정보={products_to_scrape}, 출력 디렉토리={out_dir}, 사용자 데이터 디렉토리={user_data_dir}, 포트={port}")
-        self.is_running = True
+        self._set_is_running(True)
         self.current_scraper_thread = threading.Thread(target=self._run_scraper_thread, args=(
             products_to_scrape, out_dir, user_data_dir, chrome_main_path, port
         ))
@@ -354,7 +346,13 @@ class OliveScraperGUI(QWidget):
 
     def _run_scraper_thread(self, products_to_scrape, out_dir, user_data_dir, chrome_main_path, port):
         driver = None
+        chrome_process = None
         try:
+            self.status_update_signal.emit("Chrome 브라우저 확인 중...")
+            logging.info("Chrome 브라우저 확인 중...")
+            from olive_scraper import ensure_chrome_debug
+            chrome_process = ensure_chrome_debug(port, user_data_dir)
+            
             self.status_update_signal.emit("Chrome 드라이버 연결 중...")
             logging.info("Chrome 드라이버 연결 중...")
             driver = connect_driver(port, chrome_main_path=chrome_main_path, user_data_dir=user_data_dir)
@@ -362,7 +360,7 @@ class OliveScraperGUI(QWidget):
             logging.info("Chrome 드라이버 연결 완료.")
 
             for i, product_data in enumerate(products_to_scrape):
-                if not self.is_running:
+                if not self._check_is_running():
                     self.update_log_output(f"전체 수집이 중지되었습니다.")
                     logging.info("사용자에 의해 전체 수집이 중지되었습니다.")
                     break
@@ -374,36 +372,71 @@ class OliveScraperGUI(QWidget):
                 self.status_update_signal.emit(f"상품 {i+1}/{len(products_to_scrape)} ({product_id}) 수집 중...")
                 self.progress_update_signal.emit(0)
 
-                # 페이지 로드 및 Cloudflare 처리 (driver 객체 재사용)
-                if not wait_for_page_load_and_handle_cloudflare(driver, product_id, timeout=60, log_callback=self.update_log_output, stop_check_callback=lambda: not self.is_running):
+                try:
+                    self.update_log_output("페이지 로드 시작...")
+                    logging.info("wait_for_page_load_and_handle_cloudflare 호출 전")
+                    load_result = wait_for_page_load_and_handle_cloudflare(driver, product_id, timeout=60, log_callback=self.update_log_output, stop_check_callback=lambda: not self._check_is_running())
+                    logging.info(f"wait_for_page_load_and_handle_cloudflare 결과: {load_result}")
+                except Exception as page_load_error:
+                    self.update_log_output(f"페이지 로드 중 예외 발생: {page_load_error}")
+                    logging.error(f"페이지 로드 중 예외 발생: {page_load_error}", exc_info=True)
+                    load_result = False
+                
+                if not load_result:
                     self.update_log_output("Cloudflare 또는 페이지 로드 문제로 인증 정보 획득 실패. 다음 상품으로 넘어갑니다.")
                     logging.warning(f"상품 {product_id}: Cloudflare 또는 페이지 로드 문제로 인증 정보 획득 실패. 다음 상품으로 넘어갑니다.")
-                    continue # 다음 상품으로 이동
+                    continue
                 
-                if not self.is_running:
+                if not self._check_is_running():
                     self.update_log_output(f"사용자에 의해 수집이 중지되었습니다. 다음 상품으로 넘어갑니다.")
                     logging.info(f"상품 {product_id}: 사용자에 의해 수집이 중지되었습니다.")
-                    continue # 다음 상품으로 이동
+                    continue
 
-                session, user_agent = extract_session_from_driver(driver)
-                reviews = fetch_reviews(session, user_agent, product_id, max_pages, log_callback=self.update_log_output, stop_check_callback=lambda: not self.is_running)
+                try:
+                    self.update_log_output("세션 정보 추출 중...")
+                    logging.info("extract_session_from_driver 호출")
+                    session, user_agent = extract_session_from_driver(driver)
+                    logging.info(f"세션 정보 추출 완료: User-Agent={user_agent[:50]}...")
+                except Exception as session_error:
+                    self.update_log_output(f"세션 정보 추출 실패: {session_error}")
+                    logging.error(f"세션 정보 추출 실패: {session_error}", exc_info=True)
+                    continue
                 
-                if not self.is_running:
+                try:
+                    self.update_log_output(f"리뷰 수집 시작: 최대 {max_pages}페이지")
+                    logging.info(f"fetch_reviews 호출: max_pages={max_pages}")
+                    
+                    reviews = fetch_reviews(session, user_agent, product_id, max_pages, log_callback=self.update_log_output, stop_check_callback=lambda: not self._check_is_running())
+                    
+                    logging.info(f"fetch_reviews 완료: {len(reviews) if reviews else 0}개 리뷰 수집")
+                    self.update_log_output(f"fetch_reviews 완료: {len(reviews) if reviews else 0}개 리뷰")
+                except Exception as fetch_error:
+                    self.update_log_output(f"리뷰 수집 중 예외 발생: {fetch_error}")
+                    logging.error(f"fetch_reviews 예외: {fetch_error}", exc_info=True)
+                    reviews = []
+                finally:
+                    try:
+                        session.close()
+                        logging.info("세션 정상 종료")
+                    except Exception as close_error:
+                        logging.debug(f"세션 종료 오류(무시 가능): {close_error}")
+                
+                if not self._check_is_running():
                     self.update_log_output(f"사용자에 의해 수집이 중지되었습니다. 결과 저장을 건너뜁니다.")
                     logging.info(f"상품 {product_id}: 사용자에 의해 수집이 중지되었습니다. 결과 저장을 건너뜀.")
-                    continue # 다음 상품으로 이동
+                    continue
 
                 if not reviews:
                     self.update_log_output(f"상품 ID {product_id}에 대해 수집된 리뷰가 없습니다.")
                     logging.warning(f"상품 ID {product_id}에 대해 수집된 리뷰가 없습니다.")
-                    continue # 다음 상품으로 이동
+                    continue
                 
                 df = process_reviews(reviews)
                 save_results(product_id, reviews, df, out_dir, log_callback=self.update_log_output)
                 self.update_log_output(f"--- 상품 {i+1}/{len(products_to_scrape)} 수집 완료: 상품 ID={product_id} ---")
                 logging.info(f"--- 상품 {i+1}/{len(products_to_scrape)} 수집 완료: 상품 ID={product_id} ---")
 
-            if self.is_running: # 모든 상품 수집이 정상적으로 완료되었을 때만 최종 메시지
+            if self._check_is_running():
                 self.update_log_output("모든 리뷰 수집이 완료되었습니다.")
                 logging.info("모든 리뷰 수집이 완료되었습니다.")
                 self.status_update_signal.emit("완료")
@@ -421,30 +454,38 @@ class OliveScraperGUI(QWidget):
         finally:
             if driver:
                 try:
-                    driver.quit() # 모든 작업 완료 후 드라이버 명시적 종료
+                    driver.quit()
                     self.update_log_output("Chrome 드라이버를 종료했습니다.")
                     logging.info("Chrome 드라이버를 종료했습니다.")
-                except Exception as e:
+                except (OSError, Exception) as e:
                     self.update_log_output(f"Chrome 드라이버 종료 중 오류 발생: {e}")
-                    logging.error(f"Chrome 드라이버 종료 중 오류 발생: {e}", exc_info=True)
-            self._reset_gui_state() # GUI 상태 초기화
+                    logging.warning(f"Chrome 드라이버 종료 중 오류 발생: {e}")
+                finally:
+                    driver = None
+            self._reset_gui_state()
 
     def stop_collection(self):
-        self.is_running = False
+        self._set_is_running(False)
         if self.current_scraper_thread and self.current_scraper_thread.is_alive():
             self.update_log_output("현재 진행 중인 스크래핑 작업을 중지 요청했습니다. 잠시 기다려주세요...")
             logging.info("스크래핑 중지 요청됨.")
-            # 스레드는 is_running 플래그를 확인하여 스스로 종료될 것임
         else:
             self.update_log_output("리뷰 수집이 중지되었습니다.")
             logging.info("리뷰 수집이 중지되었습니다.")
             self._reset_gui_state()
 
+    def _check_is_running(self):
+        with self.is_running_lock:
+            return self.is_running
+    
+    def _set_is_running(self, value):
+        with self.is_running_lock:
+            self.is_running = value
+
     def _reset_gui_state(self):
-        # 메인 스레드에서 GUI 상태를 안전하게 초기화
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        self.is_running = False
+        self._set_is_running(False)
         self.status_update_signal.emit("준비 완료")
         self.progress_update_signal.emit(0)
         logging.info("GUI 상태 초기화됨.")
